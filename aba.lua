@@ -3,6 +3,53 @@ if not game:IsLoaded() then
 end
 
 --==============================================================
+--  SINGLETON GUARD
+--  Executors that auto-execute can fire more than once per session.
+--  Two copies means two auto_loops fighting over teleports and two
+--  render loops burning memory, which looks exactly like a leak.
+--==============================================================
+do
+	local FLAG = "__JOBJOINER_RUNNING__"
+
+	if getgenv then
+		local env = getgenv()
+		if env[FLAG] then
+			-- ask the previous instance to shut down, then take over
+			pcall(function()
+				env[FLAG].kill = true
+			end)
+			task.wait(0.5)
+		end
+		env[FLAG] = { kill = false, startedAt = os.time() }
+	end
+
+	-- destroy any GUI left behind by a previous injection
+	for _, container in ipairs({
+		(gethui and gethui()) or nil,
+		game:GetService("CoreGui"),
+		game:GetService("Players").LocalPlayer:FindFirstChild("PlayerGui"),
+	}) do
+		if container then
+			for _, child in ipairs(container:GetChildren()) do
+				if child.Name == "JobIdJoiner" then
+					pcall(function()
+						child:Destroy()
+					end)
+				end
+			end
+		end
+	end
+end
+
+local function should_stop()
+	if not getgenv then
+		return false
+	end
+	local slot = getgenv()["__JOBJOINER_RUNNING__"]
+	return (type(slot) == "table") and slot.kill == true
+end
+
+--==============================================================
 --  JOB ID JOINER — LocalScript (timer-aware + auto explore + stats)
 --  StarterPlayer > StarterPlayerScripts > JobJoiner (LocalScript)
 --==============================================================
@@ -30,10 +77,23 @@ local TP_HIST_MAX = 60 -- history points carried in teleportData
 local MAX_HISTORY = 400 -- history points kept in memory
 local GRAPH_POINTS = 48 -- bars drawn in the sparkline
 
---// client safety
-local DISK_INTERVAL = 20 -- min seconds between writefile calls
-local EXPLORE_COOLDOWN = 3 -- pause between exploration hops
-local MAX_EXPLORE_FAILS = 3 -- give up exploring after this many empty picks
+--// tuning (grouped: Luau caps a function at 200 locals)
+local CFG = {
+	DISK_INTERVAL = 20, -- min seconds between writefile calls
+	EXPLORE_COOLDOWN = 3, -- pause between exploration hops
+	MAX_EXPLORE_FAILS = 3, -- give up exploring after this many empty picks
+	AUTO_MAX_HOURS = 0, -- stop auto after N hours (0 = run forever)
+	MEM_GROWTH_MB = 400, -- pause when Lua heap grows this much past baseline
+	MEM_PAUSE_SECS = 30, -- how long to idle while memory settles
+	MEM_GIVEUP_MIN = 10, -- turn auto off if memory never recovers in N minutes
+	MIN_HOP_INTERVAL = 25, -- hard floor in seconds between teleports (0 = off)
+	LOW_GRAPHICS = true, -- force the lowest quality level on every join
+	DISABLE_3D = false, -- stop rendering the world entirely (GUI still shows)
+	LOG_FILE = "jobjoiner_log.txt", -- crash breadcrumbs (executor only)
+	LOG_MAX_KB = 512, -- rotate the log past this size
+	TARGET_FILE = "next_target.txt", -- where the AHK watchdog should rejoin
+	TARGET_INTERVAL = 20, -- seconds between target file writes
+}
 
 --// timer tracking
 local HINT_NAME = "Message" -- workspace child holding the countdown
@@ -935,6 +995,9 @@ local persist_backend = "memory"
 local auto_enabled = false
 local auto_status = "idle"
 local explore_fails = 0
+local auto_started_at = nil -- os.time() when auto was switched on
+local mem_baseline = nil -- Lua heap MB shortly after boot
+local mem_pressure_since = nil -- when memory first went over budget
 
 local stats = {
 	sessionStart = os.time(),
@@ -951,6 +1014,84 @@ local stats = {
 
 local function has_files()
 	return (writefile and readfile and isfile) and true or false
+end
+
+--// hand-off to an external watchdog: if the client dies, this is where it
+--// should come back to. Written to disk so it survives the process.
+local last_target_write = 0
+
+local function write_next_target(force)
+	if not has_files() then
+		return
+	end
+	if not force and (tick() - last_target_write) < CFG.TARGET_INTERVAL then
+		return
+	end
+	last_target_write = tick()
+
+	local id = game.JobId
+	if id == "" then
+		return
+	end
+	pcall(writefile, CFG.TARGET_FILE, id)
+end
+
+--// breadcrumb log: survives the crash, unlike anything held in memory
+local log_ready = false
+local log_lines = 0
+
+local function log_rotate()
+	if not has_files() then
+		return
+	end
+	local okE, exists = pcall(isfile, CFG.LOG_FILE)
+	if not (okE and exists) then
+		return
+	end
+	local okR, body = pcall(readfile, CFG.LOG_FILE)
+	if okR and #body > CFG.LOG_MAX_KB * 1024 then
+		-- keep the newest half so a long session still has context
+		pcall(writefile, CFG.LOG_FILE, body:sub(math.floor(#body / 2)))
+	end
+end
+
+local function logf(fmt, ...)
+	local okMsg, msg = pcall(string.format, fmt, ...)
+	if not okMsg then
+		msg = tostring(fmt)
+	end
+
+	local okMem, kb = pcall(collectgarbage, "count")
+	local line = string.format(
+		"[%s] [%5.0fMB] [%s] %s",
+		os.date("%H:%M:%S"),
+		(okMem and type(kb) == "number") and (kb / 1024) or 0,
+		(game.JobId ~= "" and game.JobId:sub(1, 8) or "studio"),
+		msg
+	)
+
+	print("[JJ] " .. msg)
+
+	if not has_files() then
+		return
+	end
+
+	if not log_ready then
+		log_ready = true
+		log_rotate()
+	end
+
+	if appendfile then
+		pcall(appendfile, CFG.LOG_FILE, line .. "\n")
+	else
+		local okR, body = pcall(readfile, CFG.LOG_FILE)
+		pcall(writefile, CFG.LOG_FILE, (okR and body or "") .. line .. "\n")
+	end
+
+	log_lines += 1
+	if log_lines % 200 == 0 then
+		log_rotate()
+	end
 end
 
 local function timer_count()
@@ -1024,6 +1165,7 @@ local function build_payload(serverLimit, timerLimit, histLimit)
 		visited = visited_order,
 		timers = tlist,
 		auto = auto_enabled,
+		autoStart = auto_started_at,
 		lead = min_lead,
 		window = hop_window,
 		claim = claim_offset,
@@ -1063,7 +1205,7 @@ local function persist_save(force)
 	end)
 
 	-- expensive, synchronous I/O: rate limit it hard
-	if has_files() and (force or (tick() - last_disk) > DISK_INTERVAL) then
+	if has_files() and (force or (tick() - last_disk) > CFG.DISK_INTERVAL) then
 		last_disk = tick()
 		pcall(writefile, PERSIST_FILE, encoded)
 	end
@@ -1319,10 +1461,11 @@ local function record_gold(gold)
 		if e then
 			e.gain = delta
 		end
-		print(("[%s] +$%s  (total $%s)"):format(os.date("%H:%M:%S"), comma(delta), comma(gold)))
+		logf("CLAIM +$%s (total $%s, claim #%d)", comma(delta), comma(gold), stats.claims)
 	end
 
 	push_history(gold)
+	write_next_target()
 	persist_save()
 end
 
@@ -1378,17 +1521,44 @@ task.spawn(watch_money)
 --==============================================================
 --  SERVER CACHE
 --==============================================================
+-- Roblox's Luau only exposes collectgarbage("count"); we cannot force a
+-- collection, so the watchdog can only observe and back off.
+local function mem_mb()
+	local ok, kb = pcall(collectgarbage, "count")
+	if not ok or type(kb) ~= "number" then
+		return 0
+	end
+	return kb / 1024
+end
+
+local function mem_over_budget()
+	if not mem_baseline then
+		return false, 0
+	end
+	local growth = mem_mb() - mem_baseline
+	return growth > CFG.MEM_GROWTH_MB, growth
+end
+
+local function auto_runtime()
+	if not auto_started_at then
+		return 0
+	end
+	return math.max(0, os.time() - auto_started_at)
+end
+
 local function update_cache_label()
 	local age = (cache_fetched_at > 0) and math.max(0, os.time() - cache_fetched_at) or 0
-	local mem = math.floor(collectgarbage("count") / 1024)
+	local mem = math.floor(mem_mb())
+	local run = auto_started_at and (" · " .. dur(auto_runtime())) or ""
 	cacheLabel.Text = string.format(
-		"cache %d · pool %d/%d · %ds · %dMB · h%d · %s",
+		"cache %d · pool %d/%d · %ds · %dMB · h%d%s · %s",
 		#server_cache,
 		timer_count(),
 		explore_target,
 		age,
 		mem,
 		stats.hops,
+		run,
 		auto_status
 	)
 end
@@ -1540,6 +1710,7 @@ local function restore_cache()
 		exploreBox.Text = tostring(explore_target)
 	end
 	auto_enabled = saved.auto == true
+	auto_started_at = tonumber(saved.autoStart)
 	sliderLead.render()
 	sliderWindow.render()
 	sliderClaim.render()
@@ -1629,6 +1800,30 @@ local function extract_job_id(txt)
 end
 
 local busy = false
+local last_hop_at = 0
+local set_auto_status -- forward declaration (defined in the AUTO MODE section)
+
+-- every DataModel rebuild leaks a little; this is the main defence against
+-- the client being OOM-killed during long sessions
+local function hop_gate_wait()
+	if CFG.MIN_HOP_INTERVAL <= 0 then
+		return true
+	end
+	local waitFor = CFG.MIN_HOP_INTERVAL - (tick() - last_hop_at)
+	if waitFor <= 0 then
+		return true
+	end
+	local deadline = tick() + waitFor
+	while tick() < deadline do
+		if auto_enabled == false and busy == false then
+			-- manual joins should not be blocked for long
+			break
+		end
+		set_auto_status(string.format("cool %.0fs", deadline - tick()))
+		task.wait(0.25)
+	end
+	return true
+end
 
 local function set_busy(state, joinText, smartText, smallestText, hopText)
 	busy = state
@@ -1642,6 +1837,20 @@ local function attempt_join(jobId, timeoutSecs, isExplore)
 	timeoutSecs = timeoutSecs or 20
 	teleport_failed, teleport_fail_reason = false, ""
 
+	local mineNow = my_remaining()
+	local targetE = timers[jobId]
+	logf(
+		"HOP#%d %s -> %s | mine %s | target %s | pool %d | cache %d",
+		stats.hops + 1,
+		isExplore and "explore" or "timed",
+		jobId:sub(1, 8),
+		mineNow and string.format("%.1fs", mineNow) or "?",
+		(targetE and targetE.phase) and string.format("%.1fs", remaining_at(targetE.phase, now_secs())) or "new",
+		timer_count(),
+		#server_cache
+	)
+
+	last_hop_at = tick()
 	mark_visited(game.JobId)
 	stats.hops += 1
 	if isExplore then
@@ -1665,7 +1874,7 @@ local function attempt_join(jobId, timeoutSecs, isExplore)
 	end
 
 	if teleport_failed then
-		warn(string.format("[TELEPORT FAILED] Could not join server: %s", teleport_fail_reason))
+		logf("HOP FAILED: %s", teleport_fail_reason)
 		stats.hops = math.max(0, stats.hops - 1)
 		if isExplore then
 			stats.explored = math.max(0, stats.explored - 1)
@@ -1673,7 +1882,7 @@ local function attempt_join(jobId, timeoutSecs, isExplore)
 		return false, teleport_fail_reason
 	end
 
-	print("[TELEPORT] Join appears successful, waiting for transition...")
+	logf("HOP ACCEPTED, transferring")
 	return true
 end
 
@@ -1868,7 +2077,7 @@ local function render_auto_button()
 	end
 end
 
-local function set_auto_status(s)
+function set_auto_status(s)
 	auto_status = s
 	render_auto_button()
 end
@@ -1919,9 +2128,67 @@ local function auto_loop()
 	end
 
 	while auto_enabled do
+		if should_stop() then
+			logf("SUPERSEDED by a newer injection — auto stopping")
+			auto_enabled = false
+			break
+		end
+
 		if busy then
 			task.wait(0.3)
 			continue
+		end
+
+		-- optional runtime limit
+		if CFG.AUTO_MAX_HOURS > 0 and auto_runtime() >= CFG.AUTO_MAX_HOURS * 3600 then
+			library:Notify(
+				string.format("Ran for %s — auto off (time limit)", dur(auto_runtime())),
+				"warn",
+				10
+			)
+			auto_enabled = false
+			persist_save(true)
+			break
+		end
+
+		-- memory watchdog: idling lets the engine reclaim between teleports
+		local over, growth = mem_over_budget()
+		if over then
+			if not mem_pressure_since then
+				mem_pressure_since = os.time()
+				logf("MEM PRESSURE +%.0fMB over baseline %.0fMB", growth, mem_baseline or 0)
+				library:Notify(
+					string.format("Memory +%dMB over baseline — pausing to settle", math.floor(growth)),
+					"warn",
+					6
+				)
+			end
+
+			if (os.time() - mem_pressure_since) > CFG.MEM_GIVEUP_MIN * 60 then
+				library:Notify(
+					string.format(
+						"Memory stayed +%dMB for %dmin — auto off, restart the client",
+						math.floor(growth),
+						CFG.MEM_GIVEUP_MIN
+					),
+					"error",
+					12
+				)
+				auto_enabled = false
+				persist_save(true)
+				break
+			end
+
+			set_auto_status(string.format("mem +%dMB", math.floor(growth)))
+			local t1 = tick()
+			while auto_enabled and (tick() - t1) < CFG.MEM_PAUSE_SECS do
+				task.wait(0.5)
+			end
+			continue
+		elseif mem_pressure_since then
+			logf("MEM RECOVERED after %ds", os.time() - mem_pressure_since)
+			mem_pressure_since = nil
+			library:Notify("Memory recovered — resuming", "ok")
 		end
 
 		prune_timers()
@@ -1938,7 +2205,7 @@ local function auto_loop()
 			local s = pick_explore_target()
 			if not s then
 				explore_fails += 1
-				if explore_fails >= MAX_EXPLORE_FAILS then
+				if explore_fails >= CFG.MAX_EXPLORE_FAILS then
 					library:Notify("Nothing new to explore — switching to timer mode", "warn", 5)
 					explore_target = math.max(1, timer_count())
 					exploreBox.Text = tostring(explore_target)
@@ -1954,6 +2221,7 @@ local function auto_loop()
 				end
 			else
 				explore_fails = 0
+				hop_gate_wait()
 				busy = true
 				box.Text = s.id
 				local ok, reason = attempt_join(s.id, 12, true)
@@ -1964,7 +2232,7 @@ local function auto_loop()
 					cooldown(15)
 				end
 			end
-			task.wait(EXPLORE_COOLDOWN)
+			task.wait(CFG.EXPLORE_COOLDOWN)
 			continue
 		end
 
@@ -1987,6 +2255,7 @@ local function auto_loop()
 
 		if targetId then
 			set_auto_status(string.format("hop %.0fs", targetR))
+			hop_gate_wait()
 			busy = true
 			box.Text = targetId
 			local ok, reason = attempt_join(targetId, 12)
@@ -2012,6 +2281,7 @@ local function auto_loop()
 					task.wait(0.3)
 				end
 			else
+				hop_gate_wait()
 				busy = true
 				box.Text = s.id
 				local ok, reason = attempt_join(s.id, 12, true)
@@ -2041,12 +2311,29 @@ local function toggle_auto(force)
 	end
 
 	auto_enabled = (force ~= nil) and force or not auto_enabled
+
+	if auto_enabled then
+		auto_started_at = auto_started_at or os.time()
+		logf("AUTO ON (pool target %d, lead %ds, window +%ds)", explore_target, min_lead, hop_window)
+	else
+		logf("AUTO OFF after %s, %d hops", dur(auto_runtime()), stats.hops)
+		auto_started_at = nil
+		mem_pressure_since = nil
+	end
+
 	persist_save(true)
 	render_auto_button()
 
 	if auto_enabled then
+		local limit = (CFG.AUTO_MAX_HOURS > 0) and string.format(", limit %gh", CFG.AUTO_MAX_HOURS) or ""
 		library:Notify(
-			string.format("Auto ON — pool %d, lead %ds, window +%ds", explore_target, min_lead, hop_window),
+			string.format(
+				"Auto ON — pool %d, lead %ds, window +%ds%s",
+				explore_target,
+				min_lead,
+				hop_window,
+				limit
+			),
 			"ok"
 		)
 		task.spawn(auto_loop)
@@ -2387,7 +2674,7 @@ end)
 --// live refresh loop
 task.spawn(function()
 	local statTick = 0
-	while gui.Parent do
+	while gui.Parent and not should_stop() do
 		update_cache_label()
 
 		local jid = game.JobId ~= "" and game.JobId:sub(1, 18) or "studio"
@@ -2436,7 +2723,75 @@ do
 	render_servers()
 	render_stats()
 
+	logf(
+		"=== BOOT === restored %s servers / %s timers (%s) | hops so far %d",
+		tostring(servers or 0),
+		tostring(tcount or 0),
+		persist_backend,
+		stats.hops
+	)
+
+	-- shrink the per-join allocation: fewer textures, no shadows, low quality
+	if CFG.LOW_GRAPHICS then
+		pcall(function()
+			settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+		end)
+		pcall(function()
+			local ugs = UserSettings():GetService("UserGameSettings")
+			ugs.SavedQualityLevel = Enum.SavedQualitySetting.QualityLevel1
+		end)
+		pcall(function()
+			local Lighting = game:GetService("Lighting")
+			Lighting.GlobalShadows = false
+			Lighting.FogEnd = 512
+			for _, fx in ipairs(Lighting:GetChildren()) do
+				if fx:IsA("PostEffect") then
+					fx.Enabled = false
+				end
+			end
+		end)
+		pcall(function()
+			local terrain = workspace:FindFirstChildOfClass("Terrain")
+			if terrain then
+				terrain.Decoration = false
+			end
+		end)
+	end
+
+	if CFG.DISABLE_3D then
+		pcall(function()
+			game:GetService("RunService"):Set3dRenderingEnabled(false)
+		end)
+	end
+
+	write_next_target(true)
+
+	-- baseline a few seconds in, once the DataModel has settled
+	task.spawn(function()
+		task.wait(8)
+		mem_baseline = mem_mb()
+		logf("MEM baseline %.0fMB", mem_baseline)
+	end)
+
+	-- periodic heartbeat so a crash leaves a fresh memory reading behind
+	task.spawn(function()
+		while gui.Parent do
+			task.wait(60)
+			write_next_target(true)
+			if auto_enabled then
+				logf(
+					"HEARTBEAT runtime %s | hops %d | pool %d | gold %s",
+					dur(auto_runtime()),
+					stats.hops,
+					timer_count(),
+					stats.lastGold and comma(stats.lastGold) or "?"
+				)
+			end
+		end
+	end)
+
 	if auto_enabled then
+		auto_started_at = auto_started_at or os.time()
 		library:Notify("Auto resumed after teleport", "ok")
 		task.spawn(auto_loop)
 	end
