@@ -115,7 +115,7 @@ local explore_target = 8 -- grow the pool to this size before timing hops
 --// persistence
 local PERSIST_FILE = "jobjoiner_cache.json"
 local PERSIST_KEY = "JobJoinerCache"
-local SCRIPT_URL = "https://raw.githubusercontent.com/matheusrodrigues-s/aba/refs/heads/main/aba.lua"
+local SCRIPT_URL = nil
 
 --// theme
 local T = {
