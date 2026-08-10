@@ -33,7 +33,6 @@ local GRAPH_POINTS = 48 -- bars drawn in the sparkline
 --// client safety
 local DISK_INTERVAL = 20 -- min seconds between writefile calls
 local EXPLORE_COOLDOWN = 3 -- pause between exploration hops
-local MAX_SESSION_HOPS = 60 -- auto shuts off past this many hops
 local MAX_EXPLORE_FAILS = 3 -- give up exploring after this many empty picks
 
 --// timer tracking
@@ -60,7 +59,7 @@ local explore_target = 8 -- grow the pool to this size before timing hops
 --// persistence
 local PERSIST_FILE = "jobjoiner_cache.json"
 local PERSIST_KEY = "JobJoinerCache"
-local SCRIPT_URL = "https://raw.githubusercontent.com/matheusrodrigues-s/aba/refs/heads/main/aba.lua"
+local SCRIPT_URL = ""
 
 --// theme
 local T = {
@@ -1923,18 +1922,6 @@ local function auto_loop()
 		if busy then
 			task.wait(0.3)
 			continue
-		end
-
-		-- client safety: too many DataModel rebuilds destabilises Roblox
-		if stats.hops >= MAX_SESSION_HOPS then
-			library:Notify(
-				string.format("Hop limit reached (%d) — auto off, restart the client", MAX_SESSION_HOPS),
-				"warn",
-				10
-			)
-			auto_enabled = false
-			persist_save(true)
-			break
 		end
 
 		prune_timers()
