@@ -3,24 +3,20 @@ if not game:IsLoaded() then
 end
 
 --==============================================================
---  SINGLETON GUARD
---  Executors that auto-execute can fire more than once per session.
---  Two copies means two auto_loops fighting over teleports and two
---  render loops burning memory, which looks exactly like a leak.
+--  SINGLETON GUARD (identity based)
+--  Executors re-inject on teleport, and every live instance queues the
+--  script again — so copies double on each hop. A shared boolean flag
+--  cannot fix this: the newcomer overwrites the slot, and the older
+--  instance then reads the NEWCOMER's flag (false) and keeps running.
+--  Instead each instance holds its own token and simply asks
+--  "is the shared slot still me?".
 --==============================================================
-do
-	local FLAG = "__JOBJOINER_RUNNING__"
+local MY_TOKEN = {}
+local JJ_SLOT = "__JOBJOINER_SLOT__"
 
+do
 	if getgenv then
-		local env = getgenv()
-		if env[FLAG] then
-			-- ask the previous instance to shut down, then take over
-			pcall(function()
-				env[FLAG].kill = true
-			end)
-			task.wait(0.5)
-		end
-		env[FLAG] = { kill = false, startedAt = os.time() }
+		getgenv()[JJ_SLOT] = MY_TOKEN
 	end
 
 	-- destroy any GUI left behind by a previous injection
@@ -41,12 +37,12 @@ do
 	end
 end
 
+-- true as soon as a newer injection claims the slot
 local function should_stop()
 	if not getgenv then
 		return false
 	end
-	local slot = getgenv()["__JOBJOINER_RUNNING__"]
-	return (type(slot) == "table") and slot.kill == true
+	return getgenv()[JJ_SLOT] ~= MY_TOKEN
 end
 
 --==============================================================
@@ -1833,8 +1829,22 @@ local function set_busy(state, joinText, smartText, smallestText, hopText)
 	btnHop.Text = hopText or "Random Hop"
 end
 
+local teleport_in_flight = false
+
 local function attempt_join(jobId, timeoutSecs, isExplore)
 	timeoutSecs = timeoutSecs or 20
+
+	-- a superseded copy must never touch TeleportService
+	if should_stop() then
+		return false, "superseded"
+	end
+
+	-- one teleport at a time, no matter how many coroutines ask
+	if teleport_in_flight then
+		return false, "teleport already in flight"
+	end
+	teleport_in_flight = true
+
 	teleport_failed, teleport_fail_reason = false, ""
 
 	local mineNow = my_remaining()
@@ -1874,6 +1884,7 @@ local function attempt_join(jobId, timeoutSecs, isExplore)
 	end
 
 	if teleport_failed then
+		teleport_in_flight = false
 		logf("HOP FAILED: %s", teleport_fail_reason)
 		stats.hops = math.max(0, stats.hops - 1)
 		if isExplore then
@@ -2694,8 +2705,9 @@ end)
 --  BOOT
 --==============================================================
 do
+	-- only the current instance may re-queue, otherwise copies double each hop
 	local qot = (syn and syn.queue_on_teleport) or queue_on_teleport
-	if qot and SCRIPT_URL then
+	if qot and SCRIPT_URL and not should_stop() then
 		pcall(qot, ('loadstring(game:HttpGet("%s"))()'):format(SCRIPT_URL))
 	end
 
@@ -2780,9 +2792,24 @@ do
 		end
 	end)
 
-	if auto_enabled then
+	if auto_enabled and not should_stop() then
 		auto_started_at = auto_started_at or os.time()
 		library:Notify("Auto resumed after teleport", "ok")
 		task.spawn(auto_loop)
 	end
+
+	-- a superseded copy tears itself down instead of lingering
+	task.spawn(function()
+		while not should_stop() do
+			task.wait(0.5)
+			if not gui.Parent then
+				return
+			end
+		end
+		logf("SUPERSEDED — shutting this copy down")
+		auto_enabled = false
+		pcall(function()
+			gui:Destroy()
+		end)
+	end)
 end
