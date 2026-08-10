@@ -1,3 +1,5 @@
+if not game:IsLoaded() then game.Loaded:Wait() end
+
 --==============================================================
 --  JOB ID JOINER — LocalScript (timer-aware + auto explore)
 --  StarterPlayer > StarterPlayerScripts > JobJoiner (LocalScript)
