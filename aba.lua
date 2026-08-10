@@ -1,4 +1,6 @@
-if not game:IsLoaded() then game.Loaded:Wait() end
+if not game:IsLoaded() then
+	game.Loaded:Wait()
+end
 
 --==============================================================
 --  JOB ID JOINER — LocalScript (timer-aware + auto explore + stats)
@@ -27,6 +29,12 @@ local TP_TIMER_MAX = 60 -- timers carried in teleportData
 local TP_HIST_MAX = 60 -- history points carried in teleportData
 local MAX_HISTORY = 400 -- history points kept in memory
 local GRAPH_POINTS = 48 -- bars drawn in the sparkline
+
+--// client safety
+local DISK_INTERVAL = 20 -- min seconds between writefile calls
+local EXPLORE_COOLDOWN = 3 -- pause between exploration hops
+local MAX_SESSION_HOPS = 60 -- auto shuts off past this many hops
+local MAX_EXPLORE_FAILS = 3 -- give up exploring after this many empty picks
 
 --// timer tracking
 local HINT_NAME = "Message" -- workspace child holding the countdown
@@ -775,12 +783,21 @@ local btnResetStats = makeButton(pageStats, 14, "Reset session")
 --  DRAG + SLIDER INPUT
 --==============================================================
 local dragging, dragStart, startPos
+local dragConn
 titleBar.InputBegan:Connect(function(input)
 	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 		dragging, dragStart, startPos = true, input.Position, main.Position
-		input.Changed:Connect(function()
+		if dragConn then
+			dragConn:Disconnect()
+			dragConn = nil
+		end
+		dragConn = input.Changed:Connect(function()
 			if input.UserInputState == Enum.UserInputState.End then
 				dragging = false
+				if dragConn then
+					dragConn:Disconnect()
+					dragConn = nil
+				end
 			end
 		end)
 	end
@@ -918,6 +935,7 @@ local fail_streak = 0
 local persist_backend = "memory"
 local auto_enabled = false
 local auto_status = "idle"
+local explore_fails = 0
 
 local stats = {
 	sessionStart = os.time(),
@@ -1026,9 +1044,9 @@ local function build_payload(serverLimit, timerLimit, histLimit)
 	}
 end
 
-local last_save = 0
+local last_save, last_disk = 0, 0
 local function persist_save(force)
-	if not force and (tick() - last_save) < 2 then
+	if not force and (tick() - last_save) < 3 then
 		return
 	end
 	last_save = tick()
@@ -1040,12 +1058,16 @@ local function persist_save(force)
 		return
 	end
 
-	if has_files() then
-		pcall(writefile, PERSIST_FILE, encoded)
-	end
+	-- cheap, in-memory: safe to do often
 	pcall(function()
 		TeleportService:SetTeleportSetting(PERSIST_KEY, encoded)
 	end)
+
+	-- expensive, synchronous I/O: rate limit it hard
+	if has_files() and (force or (tick() - last_disk) > DISK_INTERVAL) then
+		last_disk = tick()
+		pcall(writefile, PERSIST_FILE, encoded)
+	end
 end
 
 local function persist_load()
@@ -1359,13 +1381,15 @@ task.spawn(watch_money)
 --==============================================================
 local function update_cache_label()
 	local age = (cache_fetched_at > 0) and math.max(0, os.time() - cache_fetched_at) or 0
+	local mem = math.floor(collectgarbage("count") / 1024)
 	cacheLabel.Text = string.format(
-		"cache %d · pool %d/%d · %ds · %s · %s",
+		"cache %d · pool %d/%d · %ds · %dMB · h%d · %s",
 		#server_cache,
 		timer_count(),
 		explore_target,
 		age,
-		persist_backend,
+		mem,
+		stats.hops,
 		auto_status
 	)
 end
@@ -1901,6 +1925,18 @@ local function auto_loop()
 			continue
 		end
 
+		-- client safety: too many DataModel rebuilds destabilises Roblox
+		if stats.hops >= MAX_SESSION_HOPS then
+			library:Notify(
+				string.format("Hop limit reached (%d) — auto off, restart the client", MAX_SESSION_HOPS),
+				"warn",
+				10
+			)
+			auto_enabled = false
+			persist_save(true)
+			break
+		end
+
 		prune_timers()
 
 		-- BOOTSTRAP: grow the pool with random unsampled servers first
@@ -1914,11 +1950,23 @@ local function auto_loop()
 			set_auto_status(string.format("explore %d/%d", timer_count(), explore_target))
 			local s = pick_explore_target()
 			if not s then
-				library:Notify("Nothing new to explore — switching to timer mode", "warn", 5)
-				explore_target = math.max(1, timer_count())
-				exploreBox.Text = tostring(explore_target)
-				persist_save(true)
+				explore_fails += 1
+				if explore_fails >= MAX_EXPLORE_FAILS then
+					library:Notify("Nothing new to explore — switching to timer mode", "warn", 5)
+					explore_target = math.max(1, timer_count())
+					exploreBox.Text = tostring(explore_target)
+					explore_fails = 0
+					persist_save(true)
+				else
+					-- back off instead of hammering the API every 0.3s
+					set_auto_status("backoff")
+					local t1 = tick()
+					while auto_enabled and (tick() - t1) < 5 do
+						task.wait(0.3)
+					end
+				end
 			else
+				explore_fails = 0
 				busy = true
 				box.Text = s.id
 				local ok, reason = attempt_join(s.id, 12, true)
@@ -1929,7 +1977,7 @@ local function auto_loop()
 					cooldown(15)
 				end
 			end
-			task.wait(0.3)
+			task.wait(EXPLORE_COOLDOWN)
 			continue
 		end
 
@@ -2146,13 +2194,8 @@ local function render_servers()
 
 		local players = (e.playing and e.max) and string.format("%d/%d · ", e.playing, e.max) or ""
 		local gain = e.gain and string.format(" · +$%s", comma(e.gain)) or ""
-		row.meta.Text = string.format(
-			"%s%dx · %ds ago%s",
-			players,
-			e.samples or 0,
-			math.floor(t - (e.seenAt or t)),
-			gain
-		)
+		row.meta.Text =
+			string.format("%s%dx · %ds ago%s", players, e.samples or 0, math.floor(t - (e.seenAt or t)), gain)
 	end
 
 	for i = shown + 1, #rowPool do
