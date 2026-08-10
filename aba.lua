@@ -34,6 +34,10 @@ local GRAPH_POINTS = 48 -- bars drawn in the sparkline
 local DISK_INTERVAL = 20 -- min seconds between writefile calls
 local EXPLORE_COOLDOWN = 3 -- pause between exploration hops
 local MAX_EXPLORE_FAILS = 3 -- give up exploring after this many empty picks
+local AUTO_MAX_HOURS = 0 -- stop auto after N hours (0 = run forever)
+local MEM_GROWTH_MB = 400 -- pause when Lua heap grows this much past baseline
+local MEM_PAUSE_SECS = 30 -- how long to idle while memory settles
+local MEM_GIVEUP_MIN = 10 -- turn auto off if memory never recovers in N minutes
 
 --// timer tracking
 local HINT_NAME = "Message" -- workspace child holding the countdown
@@ -59,7 +63,7 @@ local explore_target = 8 -- grow the pool to this size before timing hops
 --// persistence
 local PERSIST_FILE = "jobjoiner_cache.json"
 local PERSIST_KEY = "JobJoinerCache"
-local SCRIPT_URL = ""
+local SCRIPT_URL = "https://raw.githubusercontent.com/matheusrodrigues-s/aba/refs/heads/main/aba.lua"
 
 --// theme
 local T = {
@@ -935,6 +939,9 @@ local persist_backend = "memory"
 local auto_enabled = false
 local auto_status = "idle"
 local explore_fails = 0
+local auto_started_at = nil -- os.time() when auto was switched on
+local mem_baseline = nil -- Lua heap MB shortly after boot
+local mem_pressure_since = nil -- when memory first went over budget
 
 local stats = {
 	sessionStart = os.time(),
@@ -1024,6 +1031,7 @@ local function build_payload(serverLimit, timerLimit, histLimit)
 		visited = visited_order,
 		timers = tlist,
 		auto = auto_enabled,
+		autoStart = auto_started_at,
 		lead = min_lead,
 		window = hop_window,
 		claim = claim_offset,
@@ -1378,17 +1386,44 @@ task.spawn(watch_money)
 --==============================================================
 --  SERVER CACHE
 --==============================================================
+-- Roblox's Luau only exposes collectgarbage("count"); we cannot force a
+-- collection, so the watchdog can only observe and back off.
+local function mem_mb()
+	local ok, kb = pcall(collectgarbage, "count")
+	if not ok or type(kb) ~= "number" then
+		return 0
+	end
+	return kb / 1024
+end
+
+local function mem_over_budget()
+	if not mem_baseline then
+		return false, 0
+	end
+	local growth = mem_mb() - mem_baseline
+	return growth > MEM_GROWTH_MB, growth
+end
+
+local function auto_runtime()
+	if not auto_started_at then
+		return 0
+	end
+	return math.max(0, os.time() - auto_started_at)
+end
+
 local function update_cache_label()
 	local age = (cache_fetched_at > 0) and math.max(0, os.time() - cache_fetched_at) or 0
-	local mem = math.floor(collectgarbage("count") / 1024)
+	local mem = math.floor(mem_mb())
+	local run = auto_started_at and (" · " .. dur(auto_runtime())) or ""
 	cacheLabel.Text = string.format(
-		"cache %d · pool %d/%d · %ds · %dMB · h%d · %s",
+		"cache %d · pool %d/%d · %ds · %dMB · h%d%s · %s",
 		#server_cache,
 		timer_count(),
 		explore_target,
 		age,
 		mem,
 		stats.hops,
+		run,
 		auto_status
 	)
 end
@@ -1540,6 +1575,7 @@ local function restore_cache()
 		exploreBox.Text = tostring(explore_target)
 	end
 	auto_enabled = saved.auto == true
+	auto_started_at = tonumber(saved.autoStart)
 	sliderLead.render()
 	sliderWindow.render()
 	sliderClaim.render()
@@ -1924,6 +1960,56 @@ local function auto_loop()
 			continue
 		end
 
+		-- optional runtime limit
+		if AUTO_MAX_HOURS > 0 and auto_runtime() >= AUTO_MAX_HOURS * 3600 then
+			library:Notify(
+				string.format("Ran for %s — auto off (time limit)", dur(auto_runtime())),
+				"warn",
+				10
+			)
+			auto_enabled = false
+			persist_save(true)
+			break
+		end
+
+		-- memory watchdog: idling lets the engine reclaim between teleports
+		local over, growth = mem_over_budget()
+		if over then
+			if not mem_pressure_since then
+				mem_pressure_since = os.time()
+				library:Notify(
+					string.format("Memory +%dMB over baseline — pausing to settle", math.floor(growth)),
+					"warn",
+					6
+				)
+			end
+
+			if (os.time() - mem_pressure_since) > MEM_GIVEUP_MIN * 60 then
+				library:Notify(
+					string.format(
+						"Memory stayed +%dMB for %dmin — auto off, restart the client",
+						math.floor(growth),
+						MEM_GIVEUP_MIN
+					),
+					"error",
+					12
+				)
+				auto_enabled = false
+				persist_save(true)
+				break
+			end
+
+			set_auto_status(string.format("mem +%dMB", math.floor(growth)))
+			local t1 = tick()
+			while auto_enabled and (tick() - t1) < MEM_PAUSE_SECS do
+				task.wait(0.5)
+			end
+			continue
+		elseif mem_pressure_since then
+			mem_pressure_since = nil
+			library:Notify("Memory recovered — resuming", "ok")
+		end
+
 		prune_timers()
 
 		-- BOOTSTRAP: grow the pool with random unsampled servers first
@@ -2041,12 +2127,27 @@ local function toggle_auto(force)
 	end
 
 	auto_enabled = (force ~= nil) and force or not auto_enabled
+
+	if auto_enabled then
+		auto_started_at = auto_started_at or os.time()
+	else
+		auto_started_at = nil
+		mem_pressure_since = nil
+	end
+
 	persist_save(true)
 	render_auto_button()
 
 	if auto_enabled then
+		local limit = (AUTO_MAX_HOURS > 0) and string.format(", limit %gh", AUTO_MAX_HOURS) or ""
 		library:Notify(
-			string.format("Auto ON — pool %d, lead %ds, window +%ds", explore_target, min_lead, hop_window),
+			string.format(
+				"Auto ON — pool %d, lead %ds, window +%ds%s",
+				explore_target,
+				min_lead,
+				hop_window,
+				limit
+			),
 			"ok"
 		)
 		task.spawn(auto_loop)
@@ -2436,7 +2537,15 @@ do
 	render_servers()
 	render_stats()
 
+	-- baseline a few seconds in, once the DataModel has settled
+	task.spawn(function()
+		task.wait(8)
+		mem_baseline = mem_mb()
+		print(string.format("[MEM] baseline %.0fMB", mem_baseline))
+	end)
+
 	if auto_enabled then
+		auto_started_at = auto_started_at or os.time()
 		library:Notify("Auto resumed after teleport", "ok")
 		task.spawn(auto_loop)
 	end
