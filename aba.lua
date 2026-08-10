@@ -82,7 +82,7 @@ local CFG = {
 	MEM_GROWTH_MB = 400, -- pause when Lua heap grows this much past baseline
 	MEM_PAUSE_SECS = 30, -- how long to idle while memory settles
 	MEM_GIVEUP_MIN = 10, -- turn auto off if memory never recovers in N minutes
-	MIN_HOP_INTERVAL = 25, -- hard floor in seconds between teleports (0 = off)
+	MIN_HOP_INTERVAL = 0, -- hard floor in seconds between teleports (0 = off)
 	LOW_GRAPHICS = true, -- force the lowest quality level on every join
 	DISABLE_3D = false, -- stop rendering the world entirely (GUI still shows)
 	LOG_FILE = "jobjoiner_log.txt", -- crash breadcrumbs (executor only)
