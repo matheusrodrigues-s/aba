@@ -119,7 +119,7 @@ local explore_target = 8 -- grow the pool to this size before timing hops
 --// persistence
 local PERSIST_FILE = "jobjoiner_cache.json"
 local PERSIST_KEY = "JobJoinerCache"
-local SCRIPT_URL = ""
+local SCRIPT_URL = "https://raw.githubusercontent.com/matheusrodrigues-s/aba/refs/heads/main/aba.lua"
 
 --// theme
 local T = {
@@ -2141,11 +2141,7 @@ local function auto_loop()
 
 		-- optional runtime limit
 		if CFG.AUTO_MAX_HOURS > 0 and auto_runtime() >= CFG.AUTO_MAX_HOURS * 3600 then
-			library:Notify(
-				string.format("Ran for %s — auto off (time limit)", dur(auto_runtime())),
-				"warn",
-				10
-			)
+			library:Notify(string.format("Ran for %s — auto off (time limit)", dur(auto_runtime())), "warn", 10)
 			auto_enabled = false
 			persist_save(true)
 			break
@@ -2327,13 +2323,7 @@ local function toggle_auto(force)
 	if auto_enabled then
 		local limit = (CFG.AUTO_MAX_HOURS > 0) and string.format(", limit %gh", CFG.AUTO_MAX_HOURS) or ""
 		library:Notify(
-			string.format(
-				"Auto ON — pool %d, lead %ds, window +%ds%s",
-				explore_target,
-				min_lead,
-				hop_window,
-				limit
-			),
+			string.format("Auto ON — pool %d, lead %ds, window +%ds%s", explore_target, min_lead, hop_window, limit),
 			"ok"
 		)
 		task.spawn(auto_loop)
