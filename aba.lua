@@ -14,9 +14,28 @@ end
 local MY_TOKEN = {}
 local JJ_SLOT = "__JOBJOINER_SLOT__"
 
+-- A duplicate injection fired by the same event arrives within milliseconds.
+-- Anything newer than this is treated as an accidental twin and aborts before
+-- building UI, hooking signals or spawning loops. A deliberate manual
+-- re-injection is always slower than this, so it still takes over normally.
+local TWIN_WINDOW = 4
+
 do
 	if getgenv then
-		getgenv()[JJ_SLOT] = MY_TOKEN
+		local env = getgenv()
+		local prev = env[JJ_SLOT]
+
+		if type(prev) == "table" and type(prev.bornAt) == "number" then
+			local age = os.clock() - prev.bornAt
+			if age >= 0 and age < TWIN_WINDOW then
+				-- an accidental twin: leave the running copy completely alone
+				warn(("[JJ] duplicate injection ignored (sibling is %.2fs old)"):format(age))
+				return
+			end
+		end
+
+		MY_TOKEN.bornAt = os.clock()
+		env[JJ_SLOT] = MY_TOKEN
 	end
 
 	-- destroy any GUI left behind by a previous injection
@@ -82,7 +101,7 @@ local CFG = {
 	MEM_GROWTH_MB = 400, -- pause when Lua heap grows this much past baseline
 	MEM_PAUSE_SECS = 30, -- how long to idle while memory settles
 	MEM_GIVEUP_MIN = 10, -- turn auto off if memory never recovers in N minutes
-	MIN_HOP_INTERVAL = 0, -- hard floor in seconds between teleports (0 = off)
+	MIN_HOP_INTERVAL = 25, -- hard floor in seconds between teleports (0 = off)
 	LOW_GRAPHICS = true, -- force the lowest quality level on every join
 	DISABLE_3D = false, -- stop rendering the world entirely (GUI still shows)
 	LOG_FILE = "jobjoiner_log.txt", -- crash breadcrumbs (executor only)
@@ -115,7 +134,7 @@ local explore_target = 8 -- grow the pool to this size before timing hops
 --// persistence
 local PERSIST_FILE = "jobjoiner_cache.json"
 local PERSIST_KEY = "JobJoinerCache"
-local SCRIPT_URL = nil
+local SCRIPT_URL = ""
 
 --// theme
 local T = {
@@ -988,6 +1007,10 @@ local timers = {} -- jobId -> {phase, samples, seenAt, playing, max, gain}
 local cache_fetched_at = 0
 local fail_streak = 0
 local persist_backend = "memory"
+-- teleports since THIS client process launched. The client dies at roughly
+-- 80 DataModel rebuilds regardless of how fast they happen, so this is the
+-- number an external watchdog needs, not the all-time total.
+local client_hops = 0
 local auto_enabled = false
 local auto_status = "idle"
 local explore_fails = 0
@@ -1029,7 +1052,8 @@ local function write_next_target(force)
 	if id == "" then
 		return
 	end
-	pcall(writefile, CFG.TARGET_FILE, id)
+	-- line 1: where to rejoin | line 2: hops since this client launched
+	pcall(writefile, CFG.TARGET_FILE, id .. "\n" .. tostring(client_hops))
 end
 
 --// breadcrumb log: survives the crash, unlike anything held in memory
@@ -1162,6 +1186,7 @@ local function build_payload(serverLimit, timerLimit, histLimit)
 		timers = tlist,
 		auto = auto_enabled,
 		autoStart = auto_started_at,
+		clientHops = client_hops,
 		lead = min_lead,
 		window = hop_window,
 		claim = claim_offset,
@@ -1547,13 +1572,14 @@ local function update_cache_label()
 	local mem = math.floor(mem_mb())
 	local run = auto_started_at and (" · " .. dur(auto_runtime())) or ""
 	cacheLabel.Text = string.format(
-		"cache %d · pool %d/%d · %ds · %dMB · h%d%s · %s",
+		"cache %d · pool %d/%d · %ds · %dMB · h%d/c%d%s · %s",
 		#server_cache,
 		timer_count(),
 		explore_target,
 		age,
 		mem,
 		stats.hops,
+		client_hops,
 		run,
 		auto_status
 	)
@@ -1707,6 +1733,14 @@ local function restore_cache()
 	end
 	auto_enabled = saved.auto == true
 	auto_started_at = tonumber(saved.autoStart)
+
+	-- teleportData only exists when we arrived by teleport. Anything else
+	-- means a fresh client process, so the rebuild counter starts over.
+	if backend == "teleportData" then
+		client_hops = tonumber(saved.clientHops) or 0
+	else
+		client_hops = 0
+	end
 	sliderLead.render()
 	sliderWindow.render()
 	sliderClaim.render()
@@ -1861,6 +1895,8 @@ local function attempt_join(jobId, timeoutSecs, isExplore)
 	)
 
 	last_hop_at = tick()
+	client_hops += 1
+	write_next_target(true)
 	mark_visited(game.JobId)
 	stats.hops += 1
 	if isExplore then
@@ -2726,11 +2762,12 @@ do
 	render_stats()
 
 	logf(
-		"=== BOOT === restored %s servers / %s timers (%s) | hops so far %d",
+		"=== BOOT === restored %s servers / %s timers (%s) | hops %d | client rebuilds %d",
 		tostring(servers or 0),
 		tostring(tcount or 0),
 		persist_backend,
-		stats.hops
+		stats.hops,
+		client_hops
 	)
 
 	-- shrink the per-join allocation: fewer textures, no shadows, low quality
