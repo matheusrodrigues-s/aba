@@ -37,7 +37,7 @@ local hop_window = 8 -- ...and no more than lead+window, else explore
 --// persistence
 local PERSIST_FILE = "jobjoiner_cache.json"
 local PERSIST_KEY = "JobJoinerCache"
-local SCRIPT_URL = "https://github.com/matheusrodrigues-s/aba/raw/refs/heads/main/aba.lua"
+local SCRIPT_URL = "https://raw.githubusercontent.com/matheusrodrigues-s/aba/refs/heads/main/aba.lua"
 
 --// theme
 local T = {
