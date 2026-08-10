@@ -3,54 +3,54 @@
 --  StarterPlayer > StarterPlayerScripts > JobJoiner (LocalScript)
 --==============================================================
 
-local Players          = game:GetService("Players")
-local TeleportService  = game:GetService("TeleportService")
+local Players = game:GetService("Players")
+local TeleportService = game:GetService("TeleportService")
 local UserInputService = game:GetService("UserInputService")
-local TweenService     = game:GetService("TweenService")
-local HttpService      = game:GetService("HttpService")
+local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
 
 local LocalPlayer = Players.LocalPlayer
 
 --// config
-local CACHE_SIZE   = 50    -- servers held in memory
-local CACHE_TTL    = 180   -- seconds before cache is considered stale
-local MAX_FAILS    = 3     -- consecutive fails before forcing a refetch
-local MAX_ATTEMPTS = 6     -- total join attempts per hop
-local FETCH_PAGES  = 3     -- max API pages per fetch
-local MAX_VISITED  = 120   -- remembered job ids
-local TP_DATA_MAX  = 25    -- servers carried in teleportData
-local TP_TIMER_MAX = 40    -- timers carried in teleportData
+local CACHE_SIZE = 50 -- servers held in memory
+local CACHE_TTL = 180 -- seconds before cache is considered stale
+local MAX_FAILS = 3 -- consecutive fails before forcing a refetch
+local MAX_ATTEMPTS = 6 -- total join attempts per hop
+local FETCH_PAGES = 3 -- max API pages per fetch
+local MAX_VISITED = 120 -- remembered job ids
+local TP_DATA_MAX = 25 -- servers carried in teleportData
+local TP_TIMER_MAX = 40 -- timers carried in teleportData
 
 --// timer tracking
-local HINT_NAME     = "Message" -- workspace child holding the countdown
-local CYCLE         = 30        -- countdown length in seconds
-local TIMER_OFFSET  = 1         -- display rounds down; add this to each reading
-local TIMER_TTL     = 3600      -- forget a phase after this many seconds
-local EVENT_EPSILON = 1.5       -- "the timer just fired" threshold
+local HINT_NAME = "Message" -- workspace child holding the countdown
+local CYCLE = 30 -- countdown length in seconds
+local TIMER_OFFSET = 1 -- display rounds down; add this to each reading
+local TIMER_TTL = 3600 -- forget a phase after this many seconds
+local EVENT_EPSILON = 1.5 -- "the timer just fired" threshold
 
 --// sliders
 local MIN_LEAD_MIN, MIN_LEAD_MAX = 1, 20
-local WINDOW_MIN,   WINDOW_MAX   = 2, 25
-local min_lead   = 6   -- need at least this much time to land
-local hop_window = 8   -- ...and no more than lead+window, else explore
+local WINDOW_MIN, WINDOW_MAX = 2, 25
+local min_lead = 6 -- need at least this much time to land
+local hop_window = 8 -- ...and no more than lead+window, else explore
 
 --// persistence
 local PERSIST_FILE = "jobjoiner_cache.json"
-local PERSIST_KEY  = "JobJoinerCache"
-local SCRIPT_URL   = "https://gist.github.com/matheusrodrigues-s/02d981b23446a72c88a8801956d8c1ee/raw/7905528dc52c1e774c1c407a36b31a21a9b62e9b/aba.lua"
+local PERSIST_KEY = "JobJoinerCache"
+local SCRIPT_URL = "https://github.com/matheusrodrigues-s/aba/raw/refs/heads/main/aba.lua"
 
 --// theme
 local T = {
-	bg      = Color3.fromRGB(18, 18, 20),
-	panel   = Color3.fromRGB(26, 26, 30),
-	input   = Color3.fromRGB(34, 34, 39),
-	stroke  = Color3.fromRGB(48, 48, 55),
-	text    = Color3.fromRGB(235, 235, 240),
-	dim     = Color3.fromRGB(130, 130, 140),
-	accent  = Color3.fromRGB(90, 140, 255),
-	ok      = Color3.fromRGB(80, 200, 120),
-	err     = Color3.fromRGB(235, 90, 90),
-	warn    = Color3.fromRGB(240, 180, 70),
+	bg = Color3.fromRGB(18, 18, 20),
+	panel = Color3.fromRGB(26, 26, 30),
+	input = Color3.fromRGB(34, 34, 39),
+	stroke = Color3.fromRGB(48, 48, 55),
+	text = Color3.fromRGB(235, 235, 240),
+	dim = Color3.fromRGB(130, 130, 140),
+	accent = Color3.fromRGB(90, 140, 255),
+	ok = Color3.fromRGB(80, 200, 120),
+	err = Color3.fromRGB(235, 90, 90),
+	warn = Color3.fromRGB(240, 180, 70),
 }
 
 --// create helper
@@ -58,19 +58,31 @@ local function new(class, props, children)
 	local inst = Instance.new(class)
 	local parent = props.Parent
 	props.Parent = nil
-	for k, v in pairs(props) do inst[k] = v end
-	for _, c in ipairs(children or {}) do c.Parent = inst end
+	for k, v in pairs(props) do
+		inst[k] = v
+	end
+	for _, c in ipairs(children or {}) do
+		c.Parent = inst
+	end
 	inst.Parent = parent
 	return inst
 end
 
-local function corner(r, p) return new("UICorner", {CornerRadius = UDim.new(0, r), Parent = p}) end
-local function stroke(c, p) return new("UIStroke", {Color = c or T.stroke, Thickness = 1, Parent = p}) end
+local function corner(r, p)
+	return new("UICorner", { CornerRadius = UDim.new(0, r), Parent = p })
+end
+local function stroke(c, p)
+	return new("UIStroke", { Color = c or T.stroke, Thickness = 1, Parent = p })
+end
 
 -- synced clock, consistent across servers
 local function now_secs()
-	local ok, t = pcall(function() return workspace:GetServerTimeNow() end)
-	if ok and type(t) == "number" and t > 0 then return t end
+	local ok, t = pcall(function()
+		return workspace:GetServerTimeNow()
+	end)
+	if ok and type(t) == "number" and t > 0 then
+		return t
+	end
 	return DateTime.now().UnixTimestampMillis / 1000
 end
 
@@ -104,16 +116,13 @@ local toastHolder = new("Frame", {
 		VerticalAlignment = Enum.VerticalAlignment.Bottom,
 		HorizontalAlignment = Enum.HorizontalAlignment.Right,
 		Padding = UDim.new(0, 8),
-	})
+	}),
 })
 
 local library = {}
 
 function library:Notify(msg, kind, duration)
-	local color = (kind == "error" and T.err)
-		or (kind == "ok" and T.ok)
-		or (kind == "warn" and T.warn)
-		or T.accent
+	local color = (kind == "error" and T.err) or (kind == "ok" and T.ok) or (kind == "warn" and T.warn) or T.accent
 
 	local card = new("Frame", {
 		Size = UDim2.new(1, 0, 0, 0),
@@ -122,7 +131,9 @@ function library:Notify(msg, kind, duration)
 		BackgroundTransparency = 1,
 		Parent = toastHolder,
 	})
-	corner(8, card); local st = stroke(T.stroke, card); st.Transparency = 1
+	corner(8, card)
+	local st = stroke(T.stroke, card)
+	st.Transparency = 1
 
 	local accentBar = new("Frame", {
 		Size = UDim2.new(0, 3, 1, -12),
@@ -131,7 +142,8 @@ function library:Notify(msg, kind, duration)
 		BackgroundTransparency = 1,
 		BorderSizePixel = 0,
 		Parent = card,
-	}); corner(2, accentBar)
+	})
+	corner(2, accentBar)
 
 	local label = new("TextLabel", {
 		Position = UDim2.new(0, 20, 0, 10),
@@ -147,20 +159,22 @@ function library:Notify(msg, kind, duration)
 		Text = tostring(msg),
 		Parent = card,
 	})
-	new("UIPadding", {PaddingBottom = UDim.new(0, 10), Parent = card})
+	new("UIPadding", { PaddingBottom = UDim.new(0, 10), Parent = card })
 
 	local info = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-	TweenService:Create(card,      info, {BackgroundTransparency = 0}):Play()
-	TweenService:Create(st,        info, {Transparency = 0}):Play()
-	TweenService:Create(accentBar, info, {BackgroundTransparency = 0}):Play()
-	TweenService:Create(label,     info, {TextTransparency = 0}):Play()
+	TweenService:Create(card, info, { BackgroundTransparency = 0 }):Play()
+	TweenService:Create(st, info, { Transparency = 0 }):Play()
+	TweenService:Create(accentBar, info, { BackgroundTransparency = 0 }):Play()
+	TweenService:Create(label, info, { TextTransparency = 0 }):Play()
 
 	task.delay(duration or 3.5, function()
-		if not card.Parent then return end
-		TweenService:Create(card,      info, {BackgroundTransparency = 1}):Play()
-		TweenService:Create(st,        info, {Transparency = 1}):Play()
-		TweenService:Create(accentBar, info, {BackgroundTransparency = 1}):Play()
-		TweenService:Create(label,     info, {TextTransparency = 1}):Play()
+		if not card.Parent then
+			return
+		end
+		TweenService:Create(card, info, { BackgroundTransparency = 1 }):Play()
+		TweenService:Create(st, info, { Transparency = 1 }):Play()
+		TweenService:Create(accentBar, info, { BackgroundTransparency = 1 }):Play()
+		TweenService:Create(label, info, { TextTransparency = 1 }):Play()
 		task.wait(0.25)
 		card:Destroy()
 	end)
@@ -169,7 +183,7 @@ end
 --==============================================================
 --  WINDOW
 --==============================================================
-local EXPANDED  = UDim2.new(0, 320, 0, 440)
+local EXPANDED = UDim2.new(0, 320, 0, 440)
 local COLLAPSED = UDim2.new(0, 320, 0, 38)
 
 local main = new("Frame", {
@@ -181,7 +195,9 @@ local main = new("Frame", {
 	BorderSizePixel = 0,
 	ClipsDescendants = true,
 	Parent = gui,
-}); corner(10, main); stroke(T.stroke, main)
+})
+corner(10, main)
+stroke(T.stroke, main)
 
 --// title bar
 local titleBar = new("Frame", {
@@ -196,7 +212,7 @@ local statusDot = new("Frame", {
 	BackgroundColor3 = T.accent,
 	BorderSizePixel = 0,
 	Parent = titleBar,
-}, { new("UICorner", {CornerRadius = UDim.new(1, 0)}) })
+}, { new("UICorner", { CornerRadius = UDim.new(1, 0) }) })
 
 new("TextLabel", {
 	Position = UDim2.new(0, 28, 0, 0),
@@ -222,17 +238,18 @@ local function iconButton(txt, x)
 		TextColor3 = T.dim,
 		Text = txt,
 		Parent = titleBar,
-	}); corner(6, b)
+	})
+	corner(6, b)
 	b.MouseEnter:Connect(function()
-		TweenService:Create(b, TweenInfo.new(0.12), {BackgroundTransparency = 0, TextColor3 = T.text}):Play()
+		TweenService:Create(b, TweenInfo.new(0.12), { BackgroundTransparency = 0, TextColor3 = T.text }):Play()
 	end)
 	b.MouseLeave:Connect(function()
-		TweenService:Create(b, TweenInfo.new(0.12), {BackgroundTransparency = 1, TextColor3 = T.dim}):Play()
+		TweenService:Create(b, TweenInfo.new(0.12), { BackgroundTransparency = 1, TextColor3 = T.dim }):Play()
 	end)
 	return b
 end
 
-local btnMin   = iconButton("–", -62)
+local btnMin = iconButton("–", -62)
 local btnClose = iconButton("×", -32)
 
 --==============================================================
@@ -248,7 +265,7 @@ local tabBar = new("Frame", {
 		FillDirection = Enum.FillDirection.Horizontal,
 		SortOrder = Enum.SortOrder.LayoutOrder,
 		Padding = UDim.new(0, 6),
-	})
+	}),
 })
 
 local body = new("Frame", {
@@ -269,10 +286,12 @@ local function makePage(name, order, label)
 		Parent = body,
 	}, {
 		new("UIPadding", {
-			PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 14),
-			PaddingTop = UDim.new(0, 2), PaddingBottom = UDim.new(0, 10),
+			PaddingLeft = UDim.new(0, 14),
+			PaddingRight = UDim.new(0, 14),
+			PaddingTop = UDim.new(0, 2),
+			PaddingBottom = UDim.new(0, 10),
 		}),
-		new("UIListLayout", {SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 6)}),
+		new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 6) }),
 	})
 
 	local btn = new("TextButton", {
@@ -286,7 +305,8 @@ local function makePage(name, order, label)
 		TextColor3 = (order == 1) and T.text or T.dim,
 		Text = label,
 		Parent = tabBar,
-	}); corner(6, btn)
+	})
+	corner(6, btn)
 
 	pages[name] = page
 	tabButtons[name] = btn
@@ -307,7 +327,7 @@ local function makePage(name, order, label)
 	return page, btn
 end
 
-local pageJoin,    tabJoin    = makePage("Join",    1, "Join")
+local pageJoin, tabJoin = makePage("Join", 1, "Join")
 local pageServers, tabServers = makePage("Servers", 2, "Servers (0)")
 
 --==============================================================
@@ -327,8 +347,10 @@ local box = new("TextBox", {
 	Text = "",
 	Parent = pageJoin,
 }, {
-	new("UIPadding", {PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10)}),
-}); corner(7, box); stroke(T.stroke, box)
+	new("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }),
+})
+corner(7, box)
+stroke(T.stroke, box)
 
 local function makeButton(parent, order, text, style, size)
 	local primary = (style == "primary")
@@ -342,24 +364,31 @@ local function makeButton(parent, order, text, style, size)
 		TextColor3 = primary and Color3.new(1, 1, 1) or T.dim,
 		Text = text,
 		Parent = parent,
-	}); corner(7, b)
-	if not primary then stroke(T.stroke, b) end
+	})
+	corner(7, b)
+	if not primary then
+		stroke(T.stroke, b)
+	end
 
-	local base  = primary and T.accent or T.panel
+	local base = primary and T.accent or T.panel
 	local hover = primary and Color3.fromRGB(110, 158, 255) or T.input
 	b:SetAttribute("base", true)
 	b.MouseEnter:Connect(function()
-		if b:GetAttribute("locked") then return end
-		TweenService:Create(b, TweenInfo.new(0.12), {BackgroundColor3 = hover}):Play()
+		if b:GetAttribute("locked") then
+			return
+		end
+		TweenService:Create(b, TweenInfo.new(0.12), { BackgroundColor3 = hover }):Play()
 	end)
 	b.MouseLeave:Connect(function()
-		if b:GetAttribute("locked") then return end
-		TweenService:Create(b, TweenInfo.new(0.12), {BackgroundColor3 = base}):Play()
+		if b:GetAttribute("locked") then
+			return
+		end
+		TweenService:Create(b, TweenInfo.new(0.12), { BackgroundColor3 = base }):Play()
 	end)
 	return b
 end
 
-local btnJoin  = makeButton(pageJoin, 2, "Join Server", "primary")
+local btnJoin = makeButton(pageJoin, 2, "Join Server", "primary")
 local btnSmart = makeButton(pageJoin, 3, "Hop to Ending Soonest")
 btnSmart.TextColor3 = T.accent
 
@@ -375,12 +404,12 @@ local btnRow = new("Frame", {
 		FillDirection = Enum.FillDirection.Horizontal,
 		SortOrder = Enum.SortOrder.LayoutOrder,
 		Padding = UDim.new(0, 6),
-	})
+	}),
 })
 
 local halfSize = UDim2.new(0.5, -3, 1, 0)
 local btnSmallest = makeButton(btnRow, 1, "Smallest", nil, halfSize)
-local btnHop      = makeButton(btnRow, 2, "Random Hop", nil, halfSize)
+local btnHop = makeButton(btnRow, 2, "Random Hop", nil, halfSize)
 
 --// generic slider
 local function makeSlider(parent, order, labelFmt, minV, maxV, getV, setV)
@@ -408,14 +437,16 @@ local function makeSlider(parent, order, labelFmt, minV, maxV, getV, setV)
 		BackgroundColor3 = T.input,
 		BorderSizePixel = 0,
 		Parent = block,
-	}); corner(3, track)
+	})
+	corner(3, track)
 
 	local fill = new("Frame", {
 		Size = UDim2.new(0, 0, 1, 0),
 		BackgroundColor3 = T.accent,
 		BorderSizePixel = 0,
 		Parent = track,
-	}); corner(3, fill)
+	})
+	corner(3, fill)
 
 	local knob = new("Frame", {
 		AnchorPoint = Vector2.new(0.5, 0.5),
@@ -425,9 +456,9 @@ local function makeSlider(parent, order, labelFmt, minV, maxV, getV, setV)
 		BorderSizePixel = 0,
 		ZIndex = 2,
 		Parent = track,
-	}, { new("UICorner", {CornerRadius = UDim.new(1, 0)}) })
+	}, { new("UICorner", { CornerRadius = UDim.new(1, 0) }) })
 
-	local api = {sliding = false}
+	local api = { sliding = false }
 
 	function api.render()
 		local v = getV()
@@ -444,8 +475,10 @@ local function makeSlider(parent, order, labelFmt, minV, maxV, getV, setV)
 	end
 
 	track.InputBegan:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1
-		or input.UserInputType == Enum.UserInputType.Touch then
+		if
+			input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch
+		then
 			api.sliding = true
 			api.fromX(input.Position.X)
 		end
@@ -455,15 +488,17 @@ local function makeSlider(parent, order, labelFmt, minV, maxV, getV, setV)
 	return api
 end
 
-local sliderLead = makeSlider(pageJoin, 6, "MIN LEAD: %ds",
-	MIN_LEAD_MIN, MIN_LEAD_MAX,
-	function() return min_lead end,
-	function(v) min_lead = v end)
+local sliderLead = makeSlider(pageJoin, 6, "MIN LEAD: %ds", MIN_LEAD_MIN, MIN_LEAD_MAX, function()
+	return min_lead
+end, function(v)
+	min_lead = v
+end)
 
-local sliderWindow = makeSlider(pageJoin, 7, "HOP WINDOW: +%ds",
-	WINDOW_MIN, WINDOW_MAX,
-	function() return hop_window end,
-	function(v) hop_window = v end)
+local sliderWindow = makeSlider(pageJoin, 7, "HOP WINDOW: +%ds", WINDOW_MIN, WINDOW_MAX, function()
+	return hop_window
+end, function(v)
+	hop_window = v
+end)
 
 --// cache status
 local cacheLabel = new("TextButton", {
@@ -480,10 +515,10 @@ local cacheLabel = new("TextButton", {
 })
 
 cacheLabel.MouseEnter:Connect(function()
-	TweenService:Create(cacheLabel, TweenInfo.new(0.12), {TextColor3 = T.text}):Play()
+	TweenService:Create(cacheLabel, TweenInfo.new(0.12), { TextColor3 = T.text }):Play()
 end)
 cacheLabel.MouseLeave:Connect(function()
-	TweenService:Create(cacheLabel, TweenInfo.new(0.12), {TextColor3 = T.dim}):Play()
+	TweenService:Create(cacheLabel, TweenInfo.new(0.12), { TextColor3 = T.dim }):Play()
 end)
 
 --// current server + live timer
@@ -498,7 +533,8 @@ local current = new("TextButton", {
 	TextTruncate = Enum.TextTruncate.AtEnd,
 	Text = "current: " .. (game.JobId ~= "" and game.JobId or "studio / no JobId"),
 	Parent = pageJoin,
-}); corner(6, current)
+})
+corner(6, current)
 
 current.MouseButton1Click:Connect(function()
 	if setclipboard then
@@ -536,7 +572,7 @@ local scroll = new("ScrollingFrame", {
 	ScrollBarImageColor3 = T.stroke,
 	Parent = pageServers,
 }, {
-	new("UIListLayout", {SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4)}),
+	new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4) }),
 })
 
 --==============================================================
@@ -544,34 +580,35 @@ local scroll = new("ScrollingFrame", {
 --==============================================================
 local dragging, dragStart, startPos
 titleBar.InputBegan:Connect(function(input)
-	if input.UserInputType == Enum.UserInputType.MouseButton1
-	or input.UserInputType == Enum.UserInputType.Touch then
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 		dragging, dragStart, startPos = true, input.Position, main.Position
 		input.Changed:Connect(function()
-			if input.UserInputState == Enum.UserInputState.End then dragging = false end
+			if input.UserInputState == Enum.UserInputState.End then
+				dragging = false
+			end
 		end)
 	end
 end)
 
 UserInputService.InputChanged:Connect(function(input)
-	if input.UserInputType == Enum.UserInputType.MouseMovement
-	or input.UserInputType == Enum.UserInputType.Touch then
-		if sliderLead.sliding   then sliderLead.fromX(input.Position.X) end
-		if sliderWindow.sliding then sliderWindow.fromX(input.Position.X) end
+	if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+		if sliderLead.sliding then
+			sliderLead.fromX(input.Position.X)
+		end
+		if sliderWindow.sliding then
+			sliderWindow.fromX(input.Position.X)
+		end
 		if dragging then
 			local d = input.Position - dragStart
-			main.Position = UDim2.new(
-				startPos.X.Scale, startPos.X.Offset + d.X,
-				startPos.Y.Scale, startPos.Y.Offset + d.Y
-			)
+			main.Position =
+				UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
 		end
 	end
 end)
 
 UserInputService.InputEnded:Connect(function(input)
-	if input.UserInputType == Enum.UserInputType.MouseButton1
-	or input.UserInputType == Enum.UserInputType.Touch then
-		sliderLead.sliding   = false
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		sliderLead.sliding = false
 		sliderWindow.sliding = false
 	end
 end)
@@ -585,20 +622,23 @@ btnMin.MouseButton1Click:Connect(function()
 	btnMin.Text = minimized and "+" or "–"
 	tabBar.Visible = not minimized
 	body.Visible = not minimized
-	TweenService:Create(main,
+	TweenService:Create(
+		main,
 		TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-		{Size = minimized and COLLAPSED or EXPANDED}
+		{ Size = minimized and COLLAPSED or EXPANDED }
 	):Play()
 end)
 
 btnClose.MouseButton1Click:Connect(function()
-	TweenService:Create(main, TweenInfo.new(0.15), {Size = UDim2.new(0, 320, 0, 0)}):Play()
+	TweenService:Create(main, TweenInfo.new(0.15), { Size = UDim2.new(0, 320, 0, 0) }):Play()
 	task.wait(0.18)
 	gui:Destroy()
 end)
 
 UserInputService.InputBegan:Connect(function(input, gpe)
-	if gpe then return end
+	if gpe then
+		return
+	end
 	if input.KeyCode == Enum.KeyCode.RightShift then
 		main.Visible = not main.Visible
 	end
@@ -609,11 +649,21 @@ end)
 --==============================================================
 local function get_request_fn()
 	local ok, fn = pcall(function()
-		if syn and syn.request then return syn.request end
-		if fluxus and fluxus.request then return fluxus.request end
-		if http and http.request then return http.request end
-		if http_request then return http_request end
-		if request then return request end
+		if syn and syn.request then
+			return syn.request
+		end
+		if fluxus and fluxus.request then
+			return fluxus.request
+		end
+		if http and http.request then
+			return http.request
+		end
+		if http_request then
+			return http_request
+		end
+		if request then
+			return request
+		end
 		return nil
 	end)
 	return ok and fn or nil
@@ -627,7 +677,7 @@ local function get_json(url, retries)
 	end
 
 	for attempt = 1, retries + 1 do
-		local ok, res = pcall(req, {Url = url, Method = "GET"})
+		local ok, res = pcall(req, { Url = url, Method = "GET" })
 		if ok then
 			local code = res.StatusCode or res.Status or 0
 
@@ -635,7 +685,9 @@ local function get_json(url, retries)
 				local ok2, data = pcall(function()
 					return HttpService:JSONDecode(res.Body)
 				end)
-				if ok2 then return data end
+				if ok2 then
+					return data
+				end
 				return nil, "invalid JSON response"
 			end
 
@@ -657,15 +709,15 @@ end
 --==============================================================
 --  STATE
 --==============================================================
-local server_cache     = {}
-local visited          = {}
-local visited_order    = {}
-local timers           = {}   -- jobId -> {phase, samples, seenAt, playing, max}
+local server_cache = {}
+local visited = {}
+local visited_order = {}
+local timers = {} -- jobId -> {phase, samples, seenAt, playing, max}
 local cache_fetched_at = 0
-local fail_streak      = 0
-local persist_backend  = "memory"
-local auto_enabled     = false
-local auto_status      = "idle"
+local fail_streak = 0
+local persist_backend = "memory"
+local auto_enabled = false
+local auto_status = "idle"
 
 local function has_files()
 	return (writefile and readfile and isfile) and true or false
@@ -673,14 +725,18 @@ end
 
 local function timer_count()
 	local n = 0
-	for _ in pairs(timers) do n += 1 end
+	for _ in pairs(timers) do
+		n += 1
+	end
 	return n
 end
 
 -- remaining seconds on a known server, at time t
 local function remaining_at(phase, t)
 	local r = (phase - t) % CYCLE
-	if r <= 0.001 then r = CYCLE end
+	if r <= 0.001 then
+		r = CYCLE
+	end
 	return r
 end
 
@@ -690,24 +746,30 @@ end
 local function build_payload(serverLimit, timerLimit)
 	local servers = {}
 	for i, s in ipairs(server_cache) do
-		if serverLimit and i > serverLimit then break end
+		if serverLimit and i > serverLimit then
+			break
+		end
 		table.insert(servers, s)
 	end
 
 	local tlist = {}
 	for id, t in pairs(timers) do
 		table.insert(tlist, {
-			id      = id,
-			phase   = t.phase,
+			id = id,
+			phase = t.phase,
 			samples = t.samples,
-			seenAt  = t.seenAt,
+			seenAt = t.seenAt,
 			playing = t.playing,
-			max     = t.max,
+			max = t.max,
 		})
 	end
-	table.sort(tlist, function(a, b) return (a.samples or 0) > (b.samples or 0) end)
+	table.sort(tlist, function(a, b)
+		return (a.samples or 0) > (b.samples or 0)
+	end)
 	if timerLimit then
-		while #tlist > timerLimit do table.remove(tlist) end
+		while #tlist > timerLimit do
+			table.remove(tlist)
+		end
 	end
 
 	return {
@@ -715,22 +777,26 @@ local function build_payload(serverLimit, timerLimit)
 		savedAt = os.time(),
 		servers = servers,
 		visited = visited_order,
-		timers  = tlist,
-		auto    = auto_enabled,
-		lead    = min_lead,
-		window  = hop_window,
+		timers = tlist,
+		auto = auto_enabled,
+		lead = min_lead,
+		window = hop_window,
 	}
 end
 
 local last_save = 0
 local function persist_save(force)
-	if not force and (tick() - last_save) < 2 then return end
+	if not force and (tick() - last_save) < 2 then
+		return
+	end
 	last_save = tick()
 
 	local ok, encoded = pcall(function()
 		return HttpService:JSONEncode(build_payload())
 	end)
-	if not ok then return end
+	if not ok then
+		return
+	end
 
 	if has_files() then
 		pcall(writefile, PERSIST_FILE, encoded)
@@ -752,7 +818,9 @@ local function persist_load()
 		return TeleportService:GetTeleportSetting(PERSIST_KEY)
 	end)
 	if ok2 and type(raw) == "string" and raw ~= "" then
-		local ok3, decoded = pcall(function() return HttpService:JSONDecode(raw) end)
+		local ok3, decoded = pcall(function()
+			return HttpService:JSONDecode(raw)
+		end)
 		if ok3 and type(decoded) == "table" then
 			return decoded, "teleportSetting"
 		end
@@ -763,7 +831,9 @@ local function persist_load()
 		if okE and exists then
 			local ok4, raw2 = pcall(readfile, PERSIST_FILE)
 			if ok4 then
-				local ok5, decoded = pcall(function() return HttpService:JSONDecode(raw2) end)
+				local ok5, decoded = pcall(function()
+					return HttpService:JSONDecode(raw2)
+				end)
 				if ok5 and type(decoded) == "table" then
 					return decoded, "file"
 				end
@@ -775,7 +845,9 @@ local function persist_load()
 end
 
 local function mark_visited(jobId)
-	if not jobId or jobId == "" or visited[jobId] then return end
+	if not jobId or jobId == "" or visited[jobId] then
+		return
+	end
 	visited[jobId] = true
 	table.insert(visited_order, jobId)
 	while #visited_order > MAX_VISITED do
@@ -790,16 +862,20 @@ end
 local live_remaining = nil
 
 local function record_timer(jobId, remaining, playing, maxP)
-	if not jobId or jobId == "" then return end
-	if type(remaining) ~= "number" or remaining < 0 or remaining > CYCLE + 2 then return end
+	if not jobId or jobId == "" then
+		return
+	end
+	if type(remaining) ~= "number" or remaining < 0 or remaining > CYCLE + 2 then
+		return
+	end
 
 	local t = now_secs()
-	local entry = timers[jobId] or {samples = 0}
-	entry.phase   = (t + remaining) % CYCLE
+	local entry = timers[jobId] or { samples = 0 }
+	entry.phase = (t + remaining) % CYCLE
 	entry.samples = (entry.samples or 0) + 1
-	entry.seenAt  = t
+	entry.seenAt = t
 	entry.playing = playing or entry.playing
-	entry.max     = maxP or entry.max
+	entry.max = maxP or entry.max
 	timers[jobId] = entry
 
 	persist_save()
@@ -822,7 +898,9 @@ local function best_in_window()
 		if id ~= game.JobId and e.phase then
 			local r = remaining_at(e.phase, t)
 			if r >= min_lead and r <= (min_lead + hop_window) then
-				if not bestR or r < bestR then bestId, bestR = id, r end
+				if not bestR or r < bestR then
+					bestId, bestR = id, r
+				end
 			end
 		end
 	end
@@ -835,24 +913,32 @@ local function timer_candidates()
 	local list = {}
 	for id, e in pairs(timers) do
 		if id ~= game.JobId and e.phase then
-			table.insert(list, {id = id, remaining = remaining_at(e.phase, t)})
+			table.insert(list, { id = id, remaining = remaining_at(e.phase, t) })
 		end
 	end
-	table.sort(list, function(a, b) return a.remaining < b.remaining end)
+	table.sort(list, function(a, b)
+		return a.remaining < b.remaining
+	end)
 	return list
 end
 
 local function my_remaining()
 	local e = timers[game.JobId]
-	if e and e.phase then return remaining_at(e.phase, now_secs()) end
+	if e and e.phase then
+		return remaining_at(e.phase, now_secs())
+	end
 	return live_remaining
 end
 
 --// parse the countdown out of the hint text
 local function parse_seconds(txt)
-	if type(txt) ~= "string" then return nil end
+	if type(txt) ~= "string" then
+		return nil
+	end
 	local m, s = txt:match("(%d+):(%d%d)")
-	if m then return tonumber(m) * 60 + tonumber(s) end
+	if m then
+		return tonumber(m) * 60 + tonumber(s)
+	end
 	local n = txt:match("(%d+%.?%d*)")
 	return n and tonumber(n) or nil
 end
@@ -863,7 +949,9 @@ local function watch_hint()
 		local t0 = tick()
 		while tick() - t0 < 30 do
 			hint = workspace:FindFirstChild(HINT_NAME)
-			if hint then break end
+			if hint then
+				break
+			end
 			task.wait(0.5)
 		end
 	end
@@ -874,7 +962,9 @@ local function watch_hint()
 
 	local function handle()
 		local r = parse_seconds(hint.Text)
-		if not r then return end
+		if not r then
+			return
+		end
 		live_remaining = r + TIMER_OFFSET
 		record_timer(game.JobId, live_remaining, #Players:GetPlayers(), Players.MaxPlayers)
 		print(("[%s] %s"):format(os.date("%H:%M:%S"), hint.Text))
@@ -892,8 +982,14 @@ task.spawn(watch_hint)
 --==============================================================
 local function update_cache_label()
 	local age = (cache_fetched_at > 0) and math.max(0, os.time() - cache_fetched_at) or 0
-	cacheLabel.Text = string.format("cache %d · pool %d · %ds · %s · %s",
-		#server_cache, timer_count(), age, persist_backend, auto_status)
+	cacheLabel.Text = string.format(
+		"cache %d · pool %d · %ds · %s · %s",
+		#server_cache,
+		timer_count(),
+		age,
+		persist_backend,
+		auto_status
+	)
 end
 
 local function cache_is_valid()
@@ -921,7 +1017,9 @@ local function fetch_cache(ignoreVisited)
 			"https://games.roblox.com/v1/games/%d/servers/Public?limit=100&excludeFullGames=true",
 			game.PlaceId
 		)
-		if cursor then url = url .. "&cursor=" .. cursor end
+		if cursor then
+			url = url .. "&cursor=" .. cursor
+		end
 
 		local data, err = get_json(url)
 		if not data then
@@ -931,16 +1029,15 @@ local function fetch_cache(ignoreVisited)
 
 		for _, s in ipairs(data.data or {}) do
 			local playing = tonumber(s.playing) or 0
-			local maxP    = tonumber(s.maxPlayers) or 0
-			local fresh   = ignoreVisited or (not visited[s.id])
-			if s.id and s.id ~= game.JobId and not seen[s.id]
-			and fresh and playing < maxP then
+			local maxP = tonumber(s.maxPlayers) or 0
+			local fresh = ignoreVisited or not visited[s.id]
+			if s.id and s.id ~= game.JobId and not seen[s.id] and fresh and playing < maxP then
 				seen[s.id] = true
-				table.insert(collected, {id = s.id, playing = playing, max = maxP})
+				table.insert(collected, { id = s.id, playing = playing, max = maxP })
 			end
 			if s.id and timers[s.id] then
 				timers[s.id].playing = playing
-				timers[s.id].max     = maxP
+				timers[s.id].max = maxP
 			end
 		end
 
@@ -959,16 +1056,18 @@ local function fetch_cache(ignoreVisited)
 		table.remove(collected)
 	end
 
-	server_cache     = collected
+	server_cache = collected
 	cache_fetched_at = os.time()
-	fail_streak      = 0
+	fail_streak = 0
 	persist_save(true)
 	update_cache_label()
 	return true
 end
 
 local function take_random()
-	if #server_cache == 0 then return nil end
+	if #server_cache == 0 then
+		return nil
+	end
 	local i = math.random(1, #server_cache)
 	local s = table.remove(server_cache, i)
 	persist_save()
@@ -977,10 +1076,14 @@ local function take_random()
 end
 
 local function take_smallest()
-	if #server_cache == 0 then return nil end
+	if #server_cache == 0 then
+		return nil
+	end
 	local bestI, bestCount = 1, math.huge
 	for i, s in ipairs(server_cache) do
-		if s.playing < bestCount then bestI, bestCount = i, s.playing end
+		if s.playing < bestCount then
+			bestI, bestCount = i, s.playing
+		end
 	end
 	local s = table.remove(server_cache, bestI)
 	persist_save()
@@ -1013,10 +1116,16 @@ local function restore_cache()
 		return false
 	end
 
-	for _, id in ipairs(saved.visited or {}) do mark_visited(id) end
+	for _, id in ipairs(saved.visited or {}) do
+		mark_visited(id)
+	end
 
-	if type(saved.lead)   == "number" then min_lead   = saved.lead end
-	if type(saved.window) == "number" then hop_window = saved.window end
+	if type(saved.lead) == "number" then
+		min_lead = saved.lead
+	end
+	if type(saved.window) == "number" then
+		hop_window = saved.window
+	end
 	auto_enabled = saved.auto == true
 	sliderLead.render()
 	sliderWindow.render()
@@ -1024,14 +1133,13 @@ local function restore_cache()
 	local t = now_secs()
 	local restoredTimers = 0
 	for _, e in ipairs(saved.timers or {}) do
-		if e.id and type(e.phase) == "number"
-		and (t - (tonumber(e.seenAt) or 0)) < TIMER_TTL then
+		if e.id and type(e.phase) == "number" and (t - (tonumber(e.seenAt) or 0)) < TIMER_TTL then
 			timers[e.id] = {
-				phase   = e.phase % CYCLE,
+				phase = e.phase % CYCLE,
 				samples = tonumber(e.samples) or 1,
-				seenAt  = tonumber(e.seenAt) or t,
+				seenAt = tonumber(e.seenAt) or t,
 				playing = tonumber(e.playing),
-				max     = tonumber(e.max),
+				max = tonumber(e.max),
 			}
 			restoredTimers += 1
 		end
@@ -1045,16 +1153,16 @@ local function restore_cache()
 		for _, s in ipairs(saved.servers or {}) do
 			if s.id and s.id ~= game.JobId then
 				table.insert(restored, {
-					id      = s.id,
+					id = s.id,
 					playing = tonumber(s.playing) or 0,
-					max     = tonumber(s.max) or 0,
+					max = tonumber(s.max) or 0,
 				})
 			end
 		end
 	end
 
 	if #restored > 0 then
-		server_cache     = restored
+		server_cache = restored
 		cache_fetched_at = tonumber(saved.savedAt) or os.time()
 	end
 
@@ -1078,7 +1186,9 @@ end)
 local function extract_job_id(txt)
 	txt = tostring(txt or ""):gsub("%s+", "")
 	local fromUrl = txt:match("gameInstanceId=([%w%-]+)")
-	if fromUrl then return fromUrl end
+	if fromUrl then
+		return fromUrl
+	end
 	local guid = txt:match("%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x")
 	return guid or txt
 end
@@ -1087,10 +1197,10 @@ local busy = false
 
 local function set_busy(state, joinText, smartText, smallestText, hopText)
 	busy = state
-	btnJoin.Text     = joinText     or "Join Server"
-	btnSmart.Text    = smartText    or "Hop to Ending Soonest"
+	btnJoin.Text = joinText or "Join Server"
+	btnSmart.Text = smartText or "Hop to Ending Soonest"
 	btnSmallest.Text = smallestText or "Smallest"
-	btnHop.Text      = hopText      or "Random Hop"
+	btnHop.Text = hopText or "Random Hop"
 end
 
 local function attempt_join(jobId, timeoutSecs)
@@ -1103,9 +1213,7 @@ local function attempt_join(jobId, timeoutSecs)
 	local tpData = { jobjoiner = build_payload(TP_DATA_MAX, TP_TIMER_MAX) }
 
 	local ok, err = pcall(function()
-		TeleportService:TeleportToPlaceInstance(
-			game.PlaceId, jobId, LocalPlayer, nil, tpData
-		)
+		TeleportService:TeleportToPlaceInstance(game.PlaceId, jobId, LocalPlayer, nil, tpData)
 	end)
 	if not ok then
 		teleport_failed = true
@@ -1137,7 +1245,9 @@ local function join_game_by_id(jobId)
 		library:Notify("You are already in this server", "warn")
 		return
 	end
-	if busy then return end
+	if busy then
+		return
+	end
 
 	set_busy(true, "Connecting...")
 	library:Notify("Joining server: " .. jobId:sub(1, 8) .. "...")
@@ -1157,7 +1267,9 @@ end
 --  SMART HOP (manual, timer-aware)
 --==============================================================
 local function smart_hop()
-	if busy then return end
+	if busy then
+		return
+	end
 
 	prune_timers()
 	local list = timer_candidates()
@@ -1170,14 +1282,15 @@ local function smart_hop()
 
 	local tried = 0
 	for _, c in ipairs(list) do
-		if tried >= MAX_ATTEMPTS then break end
+		if tried >= MAX_ATTEMPTS then
+			break
+		end
 		local e = timers[c.id]
 		if e then
 			local r = remaining_at(e.phase, now_secs())
 			if r >= min_lead then
 				tried += 1
-				library:Notify(string.format("Target %s — %.1fs left (try %d)",
-					c.id:sub(1, 8), r, tried))
+				library:Notify(string.format("Target %s — %.1fs left (try %d)", c.id:sub(1, 8), r, tried))
 				box.Text = c.id
 
 				local ok, reason = attempt_join(c.id, 12)
@@ -1212,7 +1325,9 @@ end
 --  CACHED HOP (smallest + random)
 --==============================================================
 local function cached_hop(picker, label)
-	if busy then return end
+	if busy then
+		return
+	end
 
 	if not get_request_fn() then
 		if picker == take_random then
@@ -1220,7 +1335,9 @@ local function cached_hop(picker, label)
 			set_busy(true, nil, nil, nil, "Hopping...")
 			mark_visited(game.JobId)
 			persist_save(true)
-			pcall(function() TeleportService:Teleport(game.PlaceId, LocalPlayer) end)
+			pcall(function()
+				TeleportService:Teleport(game.PlaceId, LocalPlayer)
+			end)
 			task.wait(5)
 			set_busy(false)
 		else
@@ -1229,9 +1346,13 @@ local function cached_hop(picker, label)
 		return
 	end
 
-	set_busy(true, nil, nil,
+	set_busy(
+		true,
+		nil,
+		nil,
 		(picker == take_smallest) and "Searching..." or nil,
-		(picker == take_random)   and "Hopping..."   or nil)
+		(picker == take_random) and "Hopping..." or nil
+	)
 
 	for attempt = 1, MAX_ATTEMPTS do
 		if fail_streak >= MAX_FAILS then
@@ -1256,8 +1377,7 @@ local function cached_hop(picker, label)
 			return
 		end
 
-		library:Notify(string.format("%s — %d/%d players (try %d)",
-			label, s.playing, s.max, attempt))
+		library:Notify(string.format("%s — %d/%d players (try %d)", label, s.playing, s.max, attempt))
 		box.Text = s.id
 
 		local ok, reason = attempt_join(s.id, 12)
@@ -1312,21 +1432,27 @@ end
 -- grab an unsampled server, refetching / widening as needed
 local function pick_explore_target()
 	local s = take_unsampled()
-	if s then return s end
+	if s then
+		return s
+	end
 
 	if get_request_fn() then
 		set_auto_status("fetching")
 		local ok = fetch_cache()
 		if ok then
 			s = take_unsampled()
-			if s then return s end
+			if s then
+				return s
+			end
 		end
 		-- everything cached is already known: drop visited and look wider
 		visited, visited_order = {}, {}
 		mark_visited(game.JobId)
 		if fetch_cache(true) then
 			s = take_unsampled()
-			if s then return s end
+			if s then
+				return s
+			end
 		end
 	end
 	return nil
@@ -1341,7 +1467,9 @@ local function auto_loop()
 	end
 
 	while auto_enabled do
-		if busy then task.wait(0.3) end
+		if busy then
+			task.wait(0.3)
+		end
 
 		prune_timers()
 
@@ -1371,7 +1499,9 @@ local function auto_loop()
 					library:Notify("Teleport rate limited — auto paused 15s", "warn", 6)
 					set_auto_status("cooldown")
 					local t1 = tick()
-					while auto_enabled and (tick() - t1) < 15 do task.wait(0.3) end
+					while auto_enabled and (tick() - t1) < 15 do
+						task.wait(0.3)
+					end
 				end
 			end
 		else
@@ -1382,7 +1512,9 @@ local function auto_loop()
 				library:Notify("No new servers to explore — auto idling", "warn", 5)
 				set_auto_status("idle")
 				local t1 = tick()
-				while auto_enabled and (tick() - t1) < 10 do task.wait(0.3) end
+				while auto_enabled and (tick() - t1) < 10 do
+					task.wait(0.3)
+				end
 			else
 				busy = true
 				box.Text = s.id
@@ -1394,7 +1526,9 @@ local function auto_loop()
 					library:Notify("Teleport rate limited — auto paused 15s", "warn", 6)
 					set_auto_status("cooldown")
 					local t1 = tick()
-					while auto_enabled and (tick() - t1) < 15 do task.wait(0.3) end
+					while auto_enabled and (tick() - t1) < 15 do
+						task.wait(0.3)
+					end
 				end
 			end
 		end
@@ -1407,7 +1541,7 @@ local function auto_loop()
 end
 
 local function toggle_auto(force)
-	auto_enabled = (force ~= nil) and force or (not auto_enabled)
+	auto_enabled = (force ~= nil) and force or not auto_enabled
 	persist_save(true)
 	render_auto_button()
 
@@ -1431,7 +1565,8 @@ local function make_row(id)
 		AutoButtonColor = false,
 		Text = "",
 		Parent = scroll,
-	}); corner(6, row)
+	})
+	corner(6, row)
 
 	local isCurrent = (id == game.JobId)
 
@@ -1473,10 +1608,10 @@ local function make_row(id)
 	})
 
 	row.MouseEnter:Connect(function()
-		TweenService:Create(row, TweenInfo.new(0.1), {BackgroundColor3 = T.input}):Play()
+		TweenService:Create(row, TweenInfo.new(0.1), { BackgroundColor3 = T.input }):Play()
 	end)
 	row.MouseLeave:Connect(function()
-		TweenService:Create(row, TweenInfo.new(0.1), {BackgroundColor3 = T.panel}):Play()
+		TweenService:Create(row, TweenInfo.new(0.1), { BackgroundColor3 = T.panel }):Play()
 	end)
 	row.MouseButton1Click:Connect(function()
 		box.Text = id
@@ -1487,7 +1622,7 @@ local function make_row(id)
 		end
 	end)
 
-	return {frame = row, name = nameLbl, meta = metaLbl, time = timeLbl}
+	return { frame = row, name = nameLbl, meta = metaLbl, time = timeLbl }
 end
 
 local function render_servers()
@@ -1508,7 +1643,9 @@ local function render_servers()
 
 		row.time.Text = string.format("%.1fs", r)
 		local inWindow = (r >= min_lead and r <= min_lead + hop_window)
-		if inWindow then usable += 1 end
+		if inWindow then
+			usable += 1
+		end
 
 		if id == game.JobId then
 			row.time.TextColor3 = T.accent
@@ -1520,11 +1657,14 @@ local function render_servers()
 			row.time.TextColor3 = T.err
 		end
 
-		local players = (e.playing and e.max)
-			and string.format("%d/%d · ", e.playing, e.max) or ""
-		row.meta.Text = string.format("%s%d sample%s · seen %ds ago",
-			players, e.samples or 0, (e.samples == 1) and "" or "s",
-			math.floor(t - (e.seenAt or t)))
+		local players = (e.playing and e.max) and string.format("%d/%d · ", e.playing, e.max) or ""
+		row.meta.Text = string.format(
+			"%s%d sample%s · seen %ds ago",
+			players,
+			e.samples or 0,
+			(e.samples == 1) and "" or "s",
+			math.floor(t - (e.seenAt or t))
+		)
 
 		row.frame.LayoutOrder = math.floor(r * 100)
 	end
@@ -1540,8 +1680,8 @@ local function render_servers()
 	if count == 0 then
 		serversHeader.Text = "DISCOVERED — waiting for first reading"
 	else
-		serversHeader.Text = string.format("%d known · %d in window [%d–%ds]",
-			count, usable, min_lead, min_lead + hop_window)
+		serversHeader.Text =
+			string.format("%d known · %d in window [%d–%ds]", count, usable, min_lead, min_lead + hop_window)
 	end
 end
 
@@ -1569,7 +1709,9 @@ btnHop.MouseButton1Click:Connect(function()
 end)
 
 cacheLabel.MouseButton1Click:Connect(function()
-	if busy or auto_enabled then return end
+	if busy or auto_enabled then
+		return
+	end
 	task.spawn(function()
 		set_busy(true)
 		cacheLabel.Text = "cache: refreshing..."
@@ -1585,7 +1727,9 @@ cacheLabel.MouseButton1Click:Connect(function()
 end)
 
 box.FocusLost:Connect(function(enter)
-	if enter then task.spawn(join_game_by_id, box.Text) end
+	if enter then
+		task.spawn(join_game_by_id, box.Text)
+	end
 end)
 
 --// live refresh loop
@@ -1601,7 +1745,9 @@ task.spawn(function()
 			current.Text = "current: " .. jid
 		end
 
-		if pages.Servers.Visible then render_servers() end
+		if pages.Servers.Visible then
+			render_servers()
+		end
 		task.wait(0.2)
 	end
 end)
@@ -1617,8 +1763,10 @@ do
 
 	local ok, servers, tcount, age = restore_cache()
 	if ok and (servers > 0 or tcount > 0) then
-		library:Notify(string.format("Restored: %d servers, %d timers (%ds, %s)",
-			servers, tcount, age, persist_backend), "ok")
+		library:Notify(
+			string.format("Restored: %d servers, %d timers (%ds, %s)", servers, tcount, age, persist_backend),
+			"ok"
+		)
 	else
 		library:Notify("UI loaded — RightShift toggles visibility", "ok")
 	end
