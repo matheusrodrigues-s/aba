@@ -22,6 +22,7 @@ local FETCH_PAGES = 3 -- max API pages per fetch
 local MAX_VISITED = 120 -- remembered job ids
 local TP_DATA_MAX = 25 -- servers carried in teleportData
 local TP_TIMER_MAX = 40 -- timers carried in teleportData
+local EVENT_LAG = 1.5  -- seconds the payout takes to land after the timer hits 0
 
 --// timer tracking
 local HINT_NAME = "Message" -- workspace child holding the countdown
@@ -1471,17 +1472,26 @@ local function auto_loop()
 	while auto_enabled do
 		if busy then
 			task.wait(0.3)
+            continue
 		end
 
 		prune_timers()
 
-		-- if our own timer is about to fire, stay for the event
-		local mine = my_remaining()
-		if mine and mine <= (min_lead + hop_window) and mine > EVENT_EPSILON then
-			set_auto_status(string.format("wait %.0fs", mine))
-			task.wait(0.25)
-			continue
-		end
+        -- stay through the payout: wait for zero, then EVENT_LAG more
+        local mine = my_remaining()
+        if mine then
+            local sinceZero = CYCLE - mine  -- só faz sentido logo após o virar
+            if mine > CYCLE - EVENT_LAG then
+                set_auto_status(string.format("payout %.1fs", EVENT_LAG - sinceZero))
+                task.wait(0.15)
+                continue
+            end
+            if mine <= (min_lead + hop_window) then
+                set_auto_status(string.format("wait %.0fs", mine))
+                task.wait(0.25)
+                continue
+            end
+        end
 
 		local targetId, targetR = best_in_window()
 
