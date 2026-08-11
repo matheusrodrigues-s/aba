@@ -122,6 +122,7 @@ local GAME = {
 	HEARTBEAT = 15, -- seconds between forced history samples
 }
 
+
 --// auto entry: the client lands in the menu after every launch, and the
 --// payout world has to be opened before any timer or gold exists
 local ENTRY = {
@@ -135,6 +136,7 @@ local ENTRY = {
 	timeout = 45, -- give up after this many seconds
 	retry = 2, -- seconds between attempts
 }
+
 
 --// sliders / inputs
 local MIN_LEAD_MIN, MIN_LEAD_MAX = 1, 20
@@ -1067,7 +1069,11 @@ local function write_next_target(force)
 		return
 	end
 	-- line 1: JobId | line 2: rebuilds this client | line 3: placeId
-	pcall(writefile, CFG.TARGET_FILE, id .. "\n" .. tostring(client_hops) .. "\n" .. tostring(game.PlaceId))
+	pcall(
+		writefile,
+		CFG.TARGET_FILE,
+		id .. "\n" .. tostring(client_hops) .. "\n" .. tostring(game.PlaceId)
+	)
 end
 
 --// breadcrumb log: survives the crash, unlike anything held in memory
@@ -1674,13 +1680,8 @@ local function enter_afk_world()
 		if btn then
 			attempts += 1
 			if attempts == 1 then
-				logf(
-					"ENTRY found %s | visible=%s | size=%dx%d",
-					why,
-					tostring(btn.Visible),
-					btn.AbsoluteSize.X,
-					btn.AbsoluteSize.Y
-				)
+				logf("ENTRY found %s | visible=%s | size=%dx%d", why,
+					tostring(btn.Visible), btn.AbsoluteSize.X, btn.AbsoluteSize.Y)
 			end
 			local how = click_button(btn, attempts)
 			logf("ENTRY click #%d via %s", attempts, how or "FAILED")
@@ -1699,7 +1700,8 @@ local function enter_afk_world()
 		task.wait(ENTRY.retry)
 	end
 
-	logf("ENTRY TIMEOUT after %ds (%d clicks) — still not in the AFK world", ENTRY.timeout, attempts)
+	logf("ENTRY TIMEOUT after %ds (%d clicks) — still not in the AFK world",
+		ENTRY.timeout, attempts)
 	library:Notify("Could not reach the AFK world automatically", "error", 8)
 	return false
 end
@@ -2481,7 +2483,11 @@ local function auto_loop()
 
 		-- optional runtime limit
 		if CFG.AUTO_MAX_HOURS > 0 and auto_runtime() >= CFG.AUTO_MAX_HOURS * 3600 then
-			library:Notify(string.format("Ran for %s — auto off (time limit)", dur(auto_runtime())), "warn", 10)
+			library:Notify(
+				string.format("Ran for %s — auto off (time limit)", dur(auto_runtime())),
+				"warn",
+				10
+			)
 			auto_enabled = false
 			persist_save(true)
 			break
@@ -2663,7 +2669,13 @@ local function toggle_auto(force)
 	if auto_enabled then
 		local limit = (CFG.AUTO_MAX_HOURS > 0) and string.format(", limit %gh", CFG.AUTO_MAX_HOURS) or ""
 		library:Notify(
-			string.format("Auto ON — pool %d, lead %ds, window +%ds%s", explore_target, min_lead, hop_window, limit),
+			string.format(
+				"Auto ON — pool %d, lead %ds, window +%ds%s",
+				explore_target,
+				min_lead,
+				hop_window,
+				limit
+			),
 			"ok"
 		)
 		task.spawn(auto_loop)
