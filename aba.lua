@@ -105,11 +105,12 @@ local CFG = {
 	MEM_GIVEUP_MIN = 10, -- turn auto off if memory never recovers in N minutes
 	MIN_HOP_INTERVAL = 0, -- hard floor in seconds between teleports (0 = off)
 	LOW_GRAPHICS = true, -- force the lowest quality level on every join
-	DISABLE_3D = true, -- stop rendering the world entirely (GUI still shows)
+	DISABLE_3D = false, -- stop rendering the world entirely (GUI still shows)
 	LOG_FILE = "jobjoiner_log.txt", -- crash breadcrumbs (executor only)
 	LOG_MAX_KB = 512, -- rotate the log past this size
 	TARGET_FILE = "next_target.txt", -- where the AHK watchdog should rejoin
 	TARGET_INTERVAL = 20, -- seconds between target file writes
+	UI_FILE = "jobjoiner_ui.json", -- window position / minimised state
 }
 
 --// game-specific hooks (grouped: Luau caps a function at 200 locals)
@@ -124,6 +125,7 @@ local GAME = {
 	HEARTBEAT = 15, -- seconds between forced history samples
 }
 
+
 --// auto entry: the client lands in the menu after every launch, and the
 --// payout world has to be opened before any timer or gold exists
 local ENTRY = {
@@ -137,6 +139,7 @@ local ENTRY = {
 	timeout = 45, -- give up after this many seconds
 	retry = 2, -- seconds between attempts
 }
+
 
 --// sliders / inputs
 local MIN_LEAD_MIN, MIN_LEAD_MAX = 1, 20
@@ -165,6 +168,9 @@ local T = {
 	err = Color3.fromRGB(235, 90, 90),
 	warn = Color3.fromRGB(240, 180, 70),
 }
+
+--// widget registry (Luau caps a function at 200 locals)
+local W = {}
 
 --// create helper
 local function new(class, props, children)
@@ -236,7 +242,7 @@ local gui = new("ScreenGui", {
 --==============================================================
 --  TOAST / NOTIFY
 --==============================================================
-local toastHolder = new("Frame", {
+W.toastHolder = new("Frame", {
 	Name = "Toasts",
 	AnchorPoint = Vector2.new(1, 1),
 	Position = UDim2.new(1, -16, 1, -16),
@@ -262,7 +268,7 @@ function library:Notify(msg, kind, duration)
 		AutomaticSize = Enum.AutomaticSize.Y,
 		BackgroundColor3 = T.panel,
 		BackgroundTransparency = 1,
-		Parent = toastHolder,
+		Parent = W.toastHolder,
 	})
 	corner(8, card)
 	local st = stroke(T.stroke, card)
@@ -333,18 +339,18 @@ corner(10, main)
 stroke(T.stroke, main)
 
 --// title bar
-local titleBar = new("Frame", {
+W.titleBar = new("Frame", {
 	Size = UDim2.new(1, 0, 0, 38),
 	BackgroundTransparency = 1,
 	Parent = main,
 })
 
-local statusDot = new("Frame", {
+W.statusDot = new("Frame", {
 	Size = UDim2.new(0, 6, 0, 6),
 	Position = UDim2.new(0, 14, 0.5, -3),
 	BackgroundColor3 = T.accent,
 	BorderSizePixel = 0,
-	Parent = titleBar,
+	Parent = W.titleBar,
 }, { new("UICorner", { CornerRadius = UDim.new(1, 0) }) })
 
 new("TextLabel", {
@@ -356,7 +362,7 @@ new("TextLabel", {
 	TextColor3 = T.text,
 	TextXAlignment = Enum.TextXAlignment.Left,
 	Text = "Server Joiner",
-	Parent = titleBar,
+	Parent = W.titleBar,
 })
 
 local function iconButton(txt, x)
@@ -370,7 +376,7 @@ local function iconButton(txt, x)
 		TextSize = 14,
 		TextColor3 = T.dim,
 		Text = txt,
-		Parent = titleBar,
+		Parent = W.titleBar,
 	})
 	corner(6, b)
 	b.MouseEnter:Connect(function()
@@ -382,13 +388,13 @@ local function iconButton(txt, x)
 	return b
 end
 
-local btnMin = iconButton("–", -62)
-local btnClose = iconButton("×", -32)
+W.btnMin = iconButton("–", -62)
+W.btnClose = iconButton("×", -32)
 
 --==============================================================
 --  TABS
 --==============================================================
-local tabBar = new("Frame", {
+W.tabBar = new("Frame", {
 	Position = UDim2.new(0, 14, 0, 38),
 	Size = UDim2.new(1, -28, 0, 24),
 	BackgroundTransparency = 1,
@@ -409,6 +415,29 @@ local body = new("Frame", {
 })
 
 local pages, tabButtons = {}, {}
+local ui_state -- forward declaration (window state, defined further down)
+local save_ui_state
+
+local function select_tab(name, remember)
+	for n, p in pairs(pages) do
+		local on = (n == name)
+		p.Visible = on
+		local tb = tabButtons[n]
+		if tb then
+			tb.BackgroundColor3 = on and T.input or T.panel
+			TweenService:Create(tb, TweenInfo.new(0.12), {
+				BackgroundTransparency = on and 0 or 1,
+				TextColor3 = on and T.text or T.dim,
+			}):Play()
+		end
+	end
+	if remember ~= false and ui_state then
+		ui_state.tab = name
+		if save_ui_state then
+			save_ui_state()
+		end
+	end
+end
 
 local function makePage(name, order, label)
 	local page = new("Frame", {
@@ -437,7 +466,7 @@ local function makePage(name, order, label)
 		TextSize = 11,
 		TextColor3 = (order == 1) and T.text or T.dim,
 		Text = label,
-		Parent = tabBar,
+		Parent = W.tabBar,
 	})
 	corner(6, btn)
 
@@ -445,16 +474,7 @@ local function makePage(name, order, label)
 	tabButtons[name] = btn
 
 	btn.MouseButton1Click:Connect(function()
-		for n, p in pairs(pages) do
-			local on = (n == name)
-			p.Visible = on
-			local tb = tabButtons[n]
-			tb.BackgroundColor3 = on and T.input or T.panel
-			TweenService:Create(tb, TweenInfo.new(0.12), {
-				BackgroundTransparency = on and 0 or 1,
-				TextColor3 = on and T.text or T.dim,
-			}):Play()
-		end
+		select_tab(name)
 	end)
 
 	return page, btn
@@ -521,9 +541,9 @@ local function makeButton(parent, order, text, style, size)
 	return b
 end
 
-local btnJoin = makeButton(pageJoin, 2, "Join Server", "primary")
-local btnSmart = makeButton(pageJoin, 3, "Hop to Ending Soonest")
-btnSmart.TextColor3 = T.accent
+W.btnJoin = makeButton(pageJoin, 2, "Join Server", "primary")
+W.btnSmart = makeButton(pageJoin, 3, "Hop to Ending Soonest")
+W.btnSmart.TextColor3 = T.accent
 
 --// explore budget input
 local exploreRow = new("Frame", {
@@ -544,7 +564,7 @@ new("TextLabel", {
 	Parent = exploreRow,
 })
 
-local exploreBox = new("TextBox", {
+W.exploreBox = new("TextBox", {
 	AnchorPoint = Vector2.new(1, 0.5),
 	Position = UDim2.new(1, 0, 0.5, 0),
 	Size = UDim2.new(0, 62, 0, 24),
@@ -557,10 +577,10 @@ local exploreBox = new("TextBox", {
 	Text = tostring(explore_target),
 	Parent = exploreRow,
 })
-corner(6, exploreBox)
-stroke(T.stroke, exploreBox)
+corner(6, W.exploreBox)
+stroke(T.stroke, W.exploreBox)
 
-local btnAuto = makeButton(pageJoin, 5, "AUTO: OFF")
+W.btnAuto = makeButton(pageJoin, 5, "AUTO: OFF")
 
 local btnRow = new("Frame", {
 	LayoutOrder = 6,
@@ -576,8 +596,8 @@ local btnRow = new("Frame", {
 })
 
 local halfSize = UDim2.new(0.5, -3, 1, 0)
-local btnSmallest = makeButton(btnRow, 1, "Smallest", nil, halfSize)
-local btnHop = makeButton(btnRow, 2, "Random Hop", nil, halfSize)
+W.btnSmallest = makeButton(btnRow, 1, "Smallest", nil, halfSize)
+W.btnHop = makeButton(btnRow, 2, "Random Hop", nil, halfSize)
 
 --// generic slider (supports decimal steps)
 local function makeSlider(parent, order, labelFmt, minV, maxV, getV, setV, step)
@@ -659,26 +679,26 @@ local function makeSlider(parent, order, labelFmt, minV, maxV, getV, setV, step)
 	return api
 end
 
-local sliderLead = makeSlider(pageJoin, 7, "MIN LEAD: %ds", MIN_LEAD_MIN, MIN_LEAD_MAX, function()
+W.sliderLead = makeSlider(pageJoin, 7, "MIN LEAD: %ds", MIN_LEAD_MIN, MIN_LEAD_MAX, function()
 	return min_lead
 end, function(v)
 	min_lead = v
 end)
 
-local sliderWindow = makeSlider(pageJoin, 8, "HOP WINDOW: +%ds", WINDOW_MIN, WINDOW_MAX, function()
+W.sliderWindow = makeSlider(pageJoin, 8, "HOP WINDOW: +%ds", WINDOW_MIN, WINDOW_MAX, function()
 	return hop_window
 end, function(v)
 	hop_window = v
 end)
 
-local sliderClaim = makeSlider(pageJoin, 9, "CLAIM OFFSET: %.1fs", CLAIM_MIN, CLAIM_MAX, function()
+W.sliderClaim = makeSlider(pageJoin, 9, "CLAIM OFFSET: %.1fs", CLAIM_MIN, CLAIM_MAX, function()
 	return claim_offset
 end, function(v)
 	claim_offset = v
 end, CLAIM_STEP)
 
 --// cache status
-local cacheLabel = new("TextButton", {
+W.cacheLabel = new("TextButton", {
 	LayoutOrder = 10,
 	Size = UDim2.new(1, 0, 0, 13),
 	BackgroundTransparency = 1,
@@ -691,11 +711,11 @@ local cacheLabel = new("TextButton", {
 	Parent = pageJoin,
 })
 
-cacheLabel.MouseEnter:Connect(function()
-	TweenService:Create(cacheLabel, TweenInfo.new(0.12), { TextColor3 = T.text }):Play()
+W.cacheLabel.MouseEnter:Connect(function()
+	TweenService:Create(W.cacheLabel, TweenInfo.new(0.12), { TextColor3 = T.text }):Play()
 end)
-cacheLabel.MouseLeave:Connect(function()
-	TweenService:Create(cacheLabel, TweenInfo.new(0.12), { TextColor3 = T.dim }):Play()
+W.cacheLabel.MouseLeave:Connect(function()
+	TweenService:Create(W.cacheLabel, TweenInfo.new(0.12), { TextColor3 = T.dim }):Play()
 end)
 
 --// current server + live timer
@@ -726,7 +746,7 @@ end)
 --==============================================================
 --  SERVERS PAGE
 --==============================================================
-local serversHeader = new("TextLabel", {
+W.serversHeader = new("TextLabel", {
 	LayoutOrder = 1,
 	Size = UDim2.new(1, 0, 0, 14),
 	BackgroundTransparency = 1,
@@ -738,7 +758,7 @@ local serversHeader = new("TextLabel", {
 	Parent = pageServers,
 })
 
-local scroll = new("ScrollingFrame", {
+W.scroll = new("ScrollingFrame", {
 	LayoutOrder = 2,
 	Size = UDim2.new(1, 0, 1, -24),
 	BackgroundTransparency = 1,
@@ -755,7 +775,7 @@ local scroll = new("ScrollingFrame", {
 --==============================================================
 --  STATS PAGE
 --==============================================================
-local statLabels = {}
+W.statLabels = {}
 
 local function statRow(order, key, label)
 	local row = new("Frame", {
@@ -786,7 +806,7 @@ local function statRow(order, key, label)
 		Text = "--",
 		Parent = row,
 	})
-	statLabels[key] = val
+	W.statLabels[key] = val
 	return val
 end
 
@@ -825,7 +845,7 @@ local graphHeader = new("TextLabel", {
 	Parent = pageStats,
 })
 
-local graphFrame = new("Frame", {
+W.graphFrame = new("Frame", {
 	LayoutOrder = 13,
 	Size = UDim2.new(1, 0, 0, 92),
 	BackgroundColor3 = T.panel,
@@ -833,16 +853,16 @@ local graphFrame = new("Frame", {
 	ClipsDescendants = true,
 	Parent = pageStats,
 })
-corner(6, graphFrame)
+corner(6, W.graphFrame)
 
-local graphCanvas = new("Frame", {
+W.graphCanvas = new("Frame", {
 	Position = UDim2.new(0, 6, 0, 16),
 	Size = UDim2.new(1, -12, 1, -24),
 	BackgroundTransparency = 1,
-	Parent = graphFrame,
+	Parent = W.graphFrame,
 })
 
-local graphMax = new("TextLabel", {
+W.graphMax = new("TextLabel", {
 	Position = UDim2.new(0, 8, 0, 2),
 	Size = UDim2.new(0.5, 0, 0, 13),
 	BackgroundTransparency = 1,
@@ -851,10 +871,10 @@ local graphMax = new("TextLabel", {
 	TextColor3 = T.dim,
 	TextXAlignment = Enum.TextXAlignment.Left,
 	Text = "",
-	Parent = graphFrame,
+	Parent = W.graphFrame,
 })
 
-local graphSpan = new("TextLabel", {
+W.graphSpan = new("TextLabel", {
 	AnchorPoint = Vector2.new(1, 0),
 	Position = UDim2.new(1, -8, 0, 2),
 	Size = UDim2.new(0.5, 0, 0, 13),
@@ -864,29 +884,119 @@ local graphSpan = new("TextLabel", {
 	TextColor3 = T.dim,
 	TextXAlignment = Enum.TextXAlignment.Right,
 	Text = "",
-	Parent = graphFrame,
+	Parent = W.graphFrame,
 })
 
-local btnResetStats = makeButton(pageStats, 14, "Reset session")
+W.btnResetStats = makeButton(pageStats, 14, "Reset session")
+W.btnClearCache = makeButton(pageStats, 15, "Clear server cache")
+W.btnClearCache.TextColor3 = T.err
+
+--==============================================================
+--  WINDOW STATE
+--  Kept in its own file, deliberately: the farm cache is write-locked while
+--  we are in the lobby, but the window can be dragged there too, and losing
+--  the position on every hop is exactly what we are fixing.
+--==============================================================
+ui_state = { xs = 0.5, xo = 0, ys = 0.5, yo = 0, min = false, tab = "Join", pending = false }
+
+local function ui_files()
+	return (writefile and readfile and isfile) and true or false
+end
+
+function save_ui_state()
+	if ui_state.pending then
+		return
+	end
+	ui_state.pending = true
+
+	-- debounce: DRAG.active fires constantly
+	task.delay(0.4, function()
+		ui_state.pending = false
+
+		ui_state.xs = main.Position.X.Scale
+		ui_state.xo = main.Position.X.Offset
+		ui_state.ys = main.Position.Y.Scale
+		ui_state.yo = main.Position.Y.Offset
+
+		local ok, encoded = pcall(function()
+			return HttpService:JSONEncode(ui_state)
+		end)
+		if not ok then
+			return
+		end
+
+		pcall(function()
+			TeleportService:SetTeleportSetting("JobJoinerUI", encoded)
+		end)
+		if ui_files() then
+			pcall(writefile, CFG.UI_FILE, encoded)
+		end
+	end)
+end
+
+local function load_ui_state()
+	local raw
+
+	-- teleport settings survive hops; the file survives client restarts
+	local ok, val = pcall(function()
+		return TeleportService:GetTeleportSetting("JobJoinerUI")
+	end)
+	if ok and type(val) == "string" and val ~= "" then
+		raw = val
+	end
+
+	if not raw and ui_files() then
+		local okE, exists = pcall(isfile, CFG.UI_FILE)
+		if okE and exists then
+			local okR, body = pcall(readfile, CFG.UI_FILE)
+			if okR then
+				raw = body
+			end
+		end
+	end
+
+	if not raw then
+		return
+	end
+
+	local okD, data = pcall(function()
+		return HttpService:JSONDecode(raw)
+	end)
+	if not okD or type(data) ~= "table" then
+		return
+	end
+
+	for _, k in ipairs({ "xs", "xo", "ys", "yo" }) do
+		if type(data[k]) == "number" then
+			ui_state[k] = data[k]
+		end
+	end
+	if type(data.min) == "boolean" then
+		ui_state.min = data.min
+	end
+	if type(data.tab) == "string" then
+		ui_state.tab = data.tab
+	end
+end
 
 --==============================================================
 --  DRAG + SLIDER INPUT
 --==============================================================
-local dragging, dragStart, startPos
-local dragConn
-titleBar.InputBegan:Connect(function(input)
+local DRAG = { active = false, start = nil, origin = nil, conn = nil }
+W.titleBar.InputBegan:Connect(function(input)
 	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-		dragging, dragStart, startPos = true, input.Position, main.Position
-		if dragConn then
-			dragConn:Disconnect()
-			dragConn = nil
+		DRAG.active, DRAG.start, DRAG.origin = true, input.Position, main.Position
+		if DRAG.conn then
+			DRAG.conn:Disconnect()
+			DRAG.conn = nil
 		end
-		dragConn = input.Changed:Connect(function()
+		DRAG.conn = input.Changed:Connect(function()
 			if input.UserInputState == Enum.UserInputState.End then
-				dragging = false
-				if dragConn then
-					dragConn:Disconnect()
-					dragConn = nil
+				DRAG.active = false
+				save_ui_state()
+				if DRAG.conn then
+					DRAG.conn:Disconnect()
+					DRAG.conn = nil
 				end
 			end
 		end)
@@ -895,28 +1005,28 @@ end)
 
 UserInputService.InputChanged:Connect(function(input)
 	if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-		if sliderLead.sliding then
-			sliderLead.fromX(input.Position.X)
+		if W.sliderLead.sliding then
+			W.sliderLead.fromX(input.Position.X)
 		end
-		if sliderWindow.sliding then
-			sliderWindow.fromX(input.Position.X)
+		if W.sliderWindow.sliding then
+			W.sliderWindow.fromX(input.Position.X)
 		end
-		if sliderClaim.sliding then
-			sliderClaim.fromX(input.Position.X)
+		if W.sliderClaim.sliding then
+			W.sliderClaim.fromX(input.Position.X)
 		end
-		if dragging then
-			local d = input.Position - dragStart
+		if DRAG.active then
+			local d = input.Position - DRAG.start
 			main.Position =
-				UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+				UDim2.new(DRAG.origin.X.Scale, DRAG.origin.X.Offset + d.X, DRAG.origin.Y.Scale, DRAG.origin.Y.Offset + d.Y)
 		end
 	end
 end)
 
 UserInputService.InputEnded:Connect(function(input)
 	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-		sliderLead.sliding = false
-		sliderWindow.sliding = false
-		sliderClaim.sliding = false
+		W.sliderLead.sliding = false
+		W.sliderWindow.sliding = false
+		W.sliderClaim.sliding = false
 	end
 end)
 
@@ -924,19 +1034,32 @@ end)
 --  MINIMIZE / CLOSE
 --==============================================================
 local minimized = false
-btnMin.MouseButton1Click:Connect(function()
-	minimized = not minimized
-	btnMin.Text = minimized and "+" or "–"
-	tabBar.Visible = not minimized
+
+local function apply_minimized(state, animate)
+	minimized = state
+	W.btnMin.Text = minimized and "+" or "–"
+	W.tabBar.Visible = not minimized
 	body.Visible = not minimized
-	TweenService:Create(
-		main,
-		TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-		{ Size = minimized and COLLAPSED or EXPANDED }
-	):Play()
+
+	local target = minimized and COLLAPSED or EXPANDED
+	if animate then
+		TweenService:Create(
+			main,
+			TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+			{ Size = target }
+		):Play()
+	else
+		main.Size = target
+	end
+end
+
+W.btnMin.MouseButton1Click:Connect(function()
+	apply_minimized(not minimized, true)
+	ui_state.min = minimized
+	save_ui_state()
 end)
 
-btnClose.MouseButton1Click:Connect(function()
+W.btnClose.MouseButton1Click:Connect(function()
 	TweenService:Create(main, TweenInfo.new(0.15), { Size = UDim2.new(0, 330, 0, 0) }):Play()
 	task.wait(0.18)
 	gui:Destroy()
@@ -1098,6 +1221,13 @@ local function write_next_target(force)
 	if not has_files() then
 		return
 	end
+
+	-- Only the farm place may publish a rejoin target. Written from the lobby,
+	-- this would send the watchdog straight back to the menu on every restart.
+	if ENTRY.teleportTo and ENTRY.teleportTo > 0 and game.PlaceId ~= ENTRY.teleportTo then
+		return
+	end
+
 	if not force and (tick() - last_target_write) < CFG.TARGET_INTERVAL then
 		return
 	end
@@ -1108,12 +1238,15 @@ local function write_next_target(force)
 		return
 	end
 	-- line 1: JobId | line 2: rebuilds this client | line 3: placeId
-	pcall(writefile, CFG.TARGET_FILE, id .. "\n" .. tostring(client_hops) .. "\n" .. tostring(game.PlaceId))
+	pcall(
+		writefile,
+		CFG.TARGET_FILE,
+		id .. "\n" .. tostring(client_hops) .. "\n" .. tostring(game.PlaceId)
+	)
 end
 
 --// breadcrumb log: survives the crash, unlike anything held in memory
-local log_ready = false
-local log_lines = 0
+local LOG = { ready = false, lines = 0 }
 
 local function log_rotate()
 	if not has_files() then
@@ -1151,8 +1284,8 @@ local function logf(fmt, ...)
 		return
 	end
 
-	if not log_ready then
-		log_ready = true
+	if not LOG.ready then
+		LOG.ready = true
 		log_rotate()
 	end
 
@@ -1163,8 +1296,8 @@ local function logf(fmt, ...)
 		pcall(writefile, CFG.LOG_FILE, (okR and body or "") .. line .. "\n")
 	end
 
-	log_lines += 1
-	if log_lines % 200 == 0 then
+	LOG.lines += 1
+	if LOG.lines % 200 == 0 then
 		log_rotate()
 	end
 end
@@ -1263,12 +1396,19 @@ local function build_payload(serverLimit, timerLimit, histLimit)
 	}
 end
 
-local last_save, last_disk = 0, 0
+-- Writing is disabled until we know this place owns the cache. Booting in the
+-- lobby used to overwrite the farm's saved pool with an empty default state,
+-- which is why a client restart came back with nothing.
+local PERSIST = { enabled = true, lastSave = 0, lastDisk = 0 }
+
 local function persist_save(force)
-	if not force and (tick() - last_save) < 3 then
+	if not PERSIST.enabled then
 		return
 	end
-	last_save = tick()
+	if not force and (tick() - PERSIST.lastSave) < 3 then
+		return
+	end
+	PERSIST.lastSave = tick()
 
 	local ok, encoded = pcall(function()
 		return HttpService:JSONEncode(build_payload(nil, nil, MAX_HISTORY))
@@ -1283,8 +1423,8 @@ local function persist_save(force)
 	end)
 
 	-- expensive, synchronous I/O: rate limit it hard
-	if has_files() and (force or (tick() - last_disk) > CFG.DISK_INTERVAL) then
-		last_disk = tick()
+	if has_files() and (force or (tick() - PERSIST.lastDisk) > CFG.DISK_INTERVAL) then
+		PERSIST.lastDisk = tick()
 		pcall(writefile, PERSIST_FILE, encoded)
 	end
 end
@@ -1718,13 +1858,8 @@ local function enter_afk_world()
 		if btn then
 			attempts += 1
 			if attempts == 1 then
-				logf(
-					"ENTRY found %s | visible=%s | size=%dx%d",
-					why,
-					tostring(btn.Visible),
-					btn.AbsoluteSize.X,
-					btn.AbsoluteSize.Y
-				)
+				logf("ENTRY found %s | visible=%s | size=%dx%d", why,
+					tostring(btn.Visible), btn.AbsoluteSize.X, btn.AbsoluteSize.Y)
 			end
 			local how = click_button(btn, attempts)
 			logf("ENTRY click #%d via %s", attempts, how or "FAILED")
@@ -1743,7 +1878,8 @@ local function enter_afk_world()
 		task.wait(ENTRY.retry)
 	end
 
-	logf("ENTRY TIMEOUT after %ds (%d clicks) — still not in the AFK world", ENTRY.timeout, attempts)
+	logf("ENTRY TIMEOUT after %ds (%d clicks) — still not in the AFK world",
+		ENTRY.timeout, attempts)
 	library:Notify("Could not reach the AFK world automatically", "error", 8)
 	return false
 end
@@ -1921,7 +2057,7 @@ local function update_cache_label()
 	local age = (cache_fetched_at > 0) and math.max(0, os.time() - cache_fetched_at) or 0
 	local mem = math.floor(mem_mb())
 	local run = auto_started_at and (" · " .. dur(auto_runtime())) or ""
-	cacheLabel.Text = string.format(
+	W.cacheLabel.Text = string.format(
 		"cache %d · pool %d/%d · %ds · %dMB · h%d/c%d%s · %s",
 		#server_cache,
 		timer_count(),
@@ -2064,7 +2200,20 @@ local function restore_cache()
 	local saved, backend = persist_load()
 	persist_backend = backend
 
-	if not saved or saved.placeId ~= game.PlaceId then
+	if saved and saved.placeId and saved.placeId ~= game.PlaceId then
+		-- another place owns this cache (typically we are in the lobby).
+		-- Leave it untouched so the farm place still has it on arrival.
+		PERSIST.enabled = false
+		logf(
+			"RESTORE skipped: cache belongs to place %s, we are in %d — saving disabled",
+			tostring(saved.placeId),
+			game.PlaceId
+		)
+		update_cache_label()
+		return false
+	end
+
+	if not saved then
 		update_cache_label()
 		return false
 	end
@@ -2084,7 +2233,7 @@ local function restore_cache()
 	end
 	if type(saved.explore) == "number" then
 		explore_target = math.clamp(math.floor(saved.explore), 1, MAX_TIMERS)
-		exploreBox.Text = tostring(explore_target)
+		W.exploreBox.Text = tostring(explore_target)
 	end
 	auto_enabled = saved.auto == true
 	auto_started_at = tonumber(saved.autoStart)
@@ -2096,9 +2245,9 @@ local function restore_cache()
 	else
 		client_hops = 0
 	end
-	sliderLead.render()
-	sliderWindow.render()
-	sliderClaim.render()
+	W.sliderLead.render()
+	W.sliderWindow.render()
+	W.sliderClaim.render()
 
 	local st = saved.stats
 	if type(st) == "table" then
@@ -2199,10 +2348,10 @@ end
 
 local function set_busy(state, joinText, smartText, smallestText, hopText)
 	busy = state
-	btnJoin.Text = joinText or "Join Server"
-	btnSmart.Text = smartText or "Hop to Ending Soonest"
-	btnSmallest.Text = smallestText or "Smallest"
-	btnHop.Text = hopText or "Random Hop"
+	W.btnJoin.Text = joinText or "Join Server"
+	W.btnSmart.Text = smartText or "Hop to Ending Soonest"
+	W.btnSmallest.Text = smallestText or "Smallest"
+	W.btnHop.Text = hopText or "Random Hop"
 end
 
 -- Guards against several coroutines calling TeleportService at once. This is a
@@ -2224,7 +2373,8 @@ local function attempt_join(jobId, timeoutSecs, isExplore)
 
 	-- one teleport at a time, no matter how many coroutines ask
 	if teleport_locked() then
-		return false, string.format("teleport in flight (%.0fs left)", TP.LOCK_TTL - (tick() - TP.inFlightAt))
+		return false,
+			string.format("teleport in flight (%.0fs left)", TP.LOCK_TTL - (tick() - TP.inFlightAt))
 	end
 	TP.inFlightAt = tick()
 
@@ -2474,18 +2624,18 @@ end
 --  AUTO MODE
 --==============================================================
 local function render_auto_button()
-	btnAuto:SetAttribute("locked", auto_enabled)
-	exploreBox.TextEditable = not auto_enabled
+	W.btnAuto:SetAttribute("locked", auto_enabled)
+	W.exploreBox.TextEditable = not auto_enabled
 	if auto_enabled then
-		btnAuto.BackgroundColor3 = T.ok
-		btnAuto.TextColor3 = Color3.new(0, 0, 0)
-		btnAuto.Text = "AUTO: " .. auto_status
-		statusDot.BackgroundColor3 = T.ok
+		W.btnAuto.BackgroundColor3 = T.ok
+		W.btnAuto.TextColor3 = Color3.new(0, 0, 0)
+		W.btnAuto.Text = "AUTO: " .. auto_status
+		W.statusDot.BackgroundColor3 = T.ok
 	else
-		btnAuto.BackgroundColor3 = T.panel
-		btnAuto.TextColor3 = T.dim
-		btnAuto.Text = "AUTO: OFF"
-		statusDot.BackgroundColor3 = T.accent
+		W.btnAuto.BackgroundColor3 = T.panel
+		W.btnAuto.TextColor3 = T.dim
+		W.btnAuto.Text = "AUTO: OFF"
+		W.statusDot.BackgroundColor3 = T.accent
 	end
 end
 
@@ -2558,7 +2708,11 @@ local function auto_loop()
 
 		-- optional runtime limit
 		if CFG.AUTO_MAX_HOURS > 0 and auto_runtime() >= CFG.AUTO_MAX_HOURS * 3600 then
-			library:Notify(string.format("Ran for %s — auto off (time limit)", dur(auto_runtime())), "warn", 10)
+			library:Notify(
+				string.format("Ran for %s — auto off (time limit)", dur(auto_runtime())),
+				"warn",
+				10
+			)
 			auto_enabled = false
 			persist_save(true)
 			break
@@ -2623,7 +2777,7 @@ local function auto_loop()
 				if explore_fails >= CFG.MAX_EXPLORE_FAILS then
 					library:Notify("Nothing new to explore — switching to timer mode", "warn", 5)
 					explore_target = math.max(1, timer_count())
-					exploreBox.Text = tostring(explore_target)
+					W.exploreBox.Text = tostring(explore_target)
 					explore_fails = 0
 					persist_save(true)
 				else
@@ -2729,11 +2883,11 @@ end
 
 local function toggle_auto(force)
 	if not auto_enabled then
-		local n = tonumber(exploreBox.Text)
+		local n = tonumber(W.exploreBox.Text)
 		if n then
 			explore_target = math.clamp(math.floor(n), 1, MAX_TIMERS)
 		end
-		exploreBox.Text = tostring(explore_target)
+		W.exploreBox.Text = tostring(explore_target)
 	end
 
 	auto_enabled = (force ~= nil) and force or not auto_enabled
@@ -2753,7 +2907,13 @@ local function toggle_auto(force)
 	if auto_enabled then
 		local limit = (CFG.AUTO_MAX_HOURS > 0) and string.format(", limit %gh", CFG.AUTO_MAX_HOURS) or ""
 		library:Notify(
-			string.format("Auto ON — pool %d, lead %ds, window +%ds%s", explore_target, min_lead, hop_window, limit),
+			string.format(
+				"Auto ON — pool %d, lead %ds, window +%ds%s",
+				explore_target,
+				min_lead,
+				hop_window,
+				limit
+			),
 			"ok"
 		)
 		task.spawn(auto_loop)
@@ -2779,7 +2939,7 @@ local function get_row(i)
 		AutoButtonColor = false,
 		Text = "",
 		Visible = false,
-		Parent = scroll,
+		Parent = W.scroll,
 	})
 	corner(6, row)
 
@@ -2899,9 +3059,9 @@ local function render_servers()
 	local count = #list
 	tabServers.Text = string.format("Servers (%d)", count)
 	if count == 0 then
-		serversHeader.Text = "DISCOVERED — waiting for first reading"
+		W.serversHeader.Text = "DISCOVERED — waiting for first reading"
 	else
-		serversHeader.Text = string.format(
+		W.serversHeader.Text = string.format(
 			"%d known%s · %d in [%d–%ds]",
 			count,
 			(count > MAX_ROWS) and (" (top " .. MAX_ROWS .. ")") or "",
@@ -2926,7 +3086,7 @@ local function get_bar(i)
 		BackgroundColor3 = T.accent,
 		BorderSizePixel = 0,
 		Visible = false,
-		Parent = graphCanvas,
+		Parent = W.graphCanvas,
 	})
 	corner(1, b)
 	barPool[i] = b
@@ -2937,8 +3097,8 @@ local function render_graph()
 	local h = stats.history
 	local n = #h
 	if n < 2 then
-		graphMax.Text = "not enough data yet"
-		graphSpan.Text = ""
+		W.graphMax.Text = "not enough data yet"
+		W.graphSpan.Text = ""
 		for i = 1, #barPool do
 			barPool[i].Visible = false
 		end
@@ -2977,8 +3137,8 @@ local function render_graph()
 		barPool[i].Visible = false
 	end
 
-	graphMax.Text = "$" .. comma(hi)
-	graphSpan.Text = dur(pts[#pts].t - pts[1].t) .. " span"
+	W.graphMax.Text = "$" .. comma(hi)
+	W.graphSpan.Text = dur(pts[#pts].t - pts[1].t) .. " span"
 end
 
 local function render_stats()
@@ -2986,34 +3146,34 @@ local function render_stats()
 	local startGold = stats.startGold
 	local elapsed = os.time() - stats.sessionStart
 
-	statLabels.started.Text = os.date("%H:%M:%S", stats.sessionStart)
-	statLabels.elapsed.Text = dur(elapsed)
-	statLabels.startGold.Text = startGold and ("$" .. comma(startGold)) or "--"
-	statLabels.nowGold.Text = nowGold and ("$" .. comma(nowGold)) or "--"
+	W.statLabels.started.Text = os.date("%H:%M:%S", stats.sessionStart)
+	W.statLabels.elapsed.Text = dur(elapsed)
+	W.statLabels.startGold.Text = startGold and ("$" .. comma(startGold)) or "--"
+	W.statLabels.nowGold.Text = nowGold and ("$" .. comma(nowGold)) or "--"
 
 	if startGold and nowGold then
 		local d = nowGold - startGold
-		statLabels.gained.Text = string.format("%s$%s", d >= 0 and "+" or "-", comma(math.abs(d)))
-		statLabels.gained.TextColor3 = (d > 0) and T.ok or ((d < 0) and T.err or T.text)
+		W.statLabels.gained.Text = string.format("%s$%s", d >= 0 and "+" or "-", comma(math.abs(d)))
+		W.statLabels.gained.TextColor3 = (d > 0) and T.ok or ((d < 0) and T.err or T.text)
 
 		local perHour = (elapsed > 5) and (d / elapsed * 3600) or 0
-		statLabels.rate.Text = "$" .. comma(perHour) .. "/h"
-		statLabels.rate.TextColor3 = (perHour > 0) and T.ok or T.text
+		W.statLabels.rate.Text = "$" .. comma(perHour) .. "/h"
+		W.statLabels.rate.TextColor3 = (perHour > 0) and T.ok or T.text
 	else
-		statLabels.gained.Text = "--"
-		statLabels.rate.Text = "--"
+		W.statLabels.gained.Text = "--"
+		W.statLabels.rate.Text = "--"
 	end
 
-	statLabels.claims.Text = tostring(stats.claims)
+	W.statLabels.claims.Text = tostring(stats.claims)
 	if stats.claims > 0 then
-		statLabels.avgClaim.Text =
+		W.statLabels.avgClaim.Text =
 			string.format("$%s / $%s", comma(stats.claimTotal / stats.claims), comma(stats.bestClaim))
 	else
-		statLabels.avgClaim.Text = "--"
+		W.statLabels.avgClaim.Text = "--"
 	end
 
-	statLabels.hops.Text = string.format("%d / %d", stats.hops, stats.explored)
-	statLabels.level.Text = stats.level and tostring(stats.level) or "--"
+	W.statLabels.hops.Text = string.format("%d / %d", stats.hops, stats.explored)
+	W.statLabels.level.Text = stats.level and tostring(stats.level) or "--"
 
 	render_graph()
 end
@@ -3021,37 +3181,89 @@ end
 --==============================================================
 --  BINDINGS
 --==============================================================
-btnJoin.MouseButton1Click:Connect(function()
+W.btnJoin.MouseButton1Click:Connect(function()
 	task.spawn(join_game_by_id, box.Text)
 end)
 
-btnSmart.MouseButton1Click:Connect(function()
+W.btnSmart.MouseButton1Click:Connect(function()
 	task.spawn(smart_hop)
 end)
 
-btnAuto.MouseButton1Click:Connect(function()
+W.btnAuto.MouseButton1Click:Connect(function()
 	toggle_auto()
 end)
 
-btnSmallest.MouseButton1Click:Connect(function()
+W.btnSmallest.MouseButton1Click:Connect(function()
 	task.spawn(cached_hop, take_smallest, "Smallest server")
 end)
 
-btnHop.MouseButton1Click:Connect(function()
+W.btnHop.MouseButton1Click:Connect(function()
 	task.spawn(cached_hop, take_random, "Random server")
 end)
 
-exploreBox.FocusLost:Connect(function()
-	local n = tonumber(exploreBox.Text)
+W.exploreBox.FocusLost:Connect(function()
+	local n = tonumber(W.exploreBox.Text)
 	if n then
 		explore_target = math.clamp(math.floor(n), 1, MAX_TIMERS)
 	end
-	exploreBox.Text = tostring(explore_target)
+	W.exploreBox.Text = tostring(explore_target)
 	persist_save(true)
 	update_cache_label()
 end)
 
-btnResetStats.MouseButton1Click:Connect(function()
+local clear_armed = false
+W.btnClearCache.MouseButton1Click:Connect(function()
+	if not clear_armed then
+		clear_armed = true
+		W.btnClearCache.Text = "Click again to confirm"
+		W.btnClearCache.BackgroundColor3 = T.err
+		W.btnClearCache.TextColor3 = Color3.new(1, 1, 1)
+		task.delay(4, function()
+			if clear_armed then
+				clear_armed = false
+				W.btnClearCache.Text = "Clear server cache"
+				W.btnClearCache.BackgroundColor3 = T.panel
+				W.btnClearCache.TextColor3 = T.err
+			end
+		end)
+		return
+	end
+
+	clear_armed = false
+	W.btnClearCache.Text = "Clear server cache"
+	W.btnClearCache.BackgroundColor3 = T.panel
+	W.btnClearCache.TextColor3 = T.err
+
+	local hadServers, hadTimers = #server_cache, timer_count()
+
+	server_cache = {}
+	timers = {}
+	visited, visited_order = {}, {}
+	cache_fetched_at = 0
+	fail_streak = 0
+	mark_visited(game.JobId)
+
+	-- the on-disk copy has to go too, or the next boot restores what we just cleared
+	if has_files() then
+		pcall(function()
+			if delfile and isfile(PERSIST_FILE) then
+				delfile(PERSIST_FILE)
+			else
+				writefile(PERSIST_FILE, "{}")
+			end
+		end)
+	end
+	pcall(function()
+		TeleportService:SetTeleportSetting(PERSIST_KEY, "")
+	end)
+
+	logf("CACHE CLEARED by user (%d servers, %d timers)", hadServers, hadTimers)
+	library:Notify(string.format("Cache cleared: %d servers, %d timers", hadServers, hadTimers), "warn", 5)
+	update_cache_label()
+	render_servers()
+end)
+
+W.btnResetStats.MouseButton1Click:Connect(function()
 	stats.sessionStart = os.time()
 	stats.startGold = stats.lastGold
 	stats.claims = 0
@@ -3067,13 +3279,13 @@ btnResetStats.MouseButton1Click:Connect(function()
 	library:Notify("Session stats reset", "ok")
 end)
 
-cacheLabel.MouseButton1Click:Connect(function()
+W.cacheLabel.MouseButton1Click:Connect(function()
 	if busy or auto_enabled then
 		return
 	end
 	task.spawn(function()
 		set_busy(true)
-		cacheLabel.Text = "cache: refreshing..."
+		W.cacheLabel.Text = "cache: refreshing..."
 		local ok, err = fetch_cache()
 		if ok then
 			library:Notify(string.format("Cache loaded: %d servers", #server_cache), "ok")
@@ -3138,6 +3350,16 @@ do
 		)
 	else
 		library:Notify("UI loaded — RightShift toggles visibility", "ok")
+	end
+
+	-- put the window back where it was, before anything is drawn
+	load_ui_state()
+	main.Position = UDim2.new(ui_state.xs, ui_state.xo, ui_state.ys, ui_state.yo)
+	if ui_state.min then
+		apply_minimized(true, false)
+	end
+	if ui_state.tab and pages[ui_state.tab] then
+		select_tab(ui_state.tab, false)
 	end
 
 	render_auto_button()
