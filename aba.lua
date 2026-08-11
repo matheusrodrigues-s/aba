@@ -95,15 +95,15 @@ local GRAPH_POINTS = 48 -- bars drawn in the sparkline
 --// tuning (grouped: Luau caps a function at 200 locals)
 local CFG = {
 	DISK_INTERVAL = 20, -- min seconds between writefile calls
-	EXPLORE_COOLDOWN = 3, -- pause between exploration hops
+	EXPLORE_COOLDOWN = 0, -- pause between exploration hops
 	MAX_EXPLORE_FAILS = 3, -- give up exploring after this many empty picks
 	AUTO_MAX_HOURS = 0, -- stop auto after N hours (0 = run forever)
 	MEM_GROWTH_MB = 400, -- pause when Lua heap grows this much past baseline
 	MEM_PAUSE_SECS = 30, -- how long to idle while memory settles
 	MEM_GIVEUP_MIN = 10, -- turn auto off if memory never recovers in N minutes
-	MIN_HOP_INTERVAL = 25, -- hard floor in seconds between teleports (0 = off)
+	MIN_HOP_INTERVAL = 0, -- hard floor in seconds between teleports (0 = off)
 	LOW_GRAPHICS = true, -- force the lowest quality level on every join
-	DISABLE_3D = false, -- stop rendering the world entirely (GUI still shows)
+	DISABLE_3D = true, -- stop rendering the world entirely (GUI still shows)
 	LOG_FILE = "jobjoiner_log.txt", -- crash breadcrumbs (executor only)
 	LOG_MAX_KB = 512, -- rotate the log past this size
 	TARGET_FILE = "next_target.txt", -- where the AHK watchdog should rejoin
