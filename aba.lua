@@ -1430,7 +1430,16 @@ local function persist_save(force)
 	-- expensive, synchronous I/O: rate limit it hard
 	if has_files() and (force or (tick() - PERSIST.lastDisk) > CFG.DISK_INTERVAL) then
 		PERSIST.lastDisk = tick()
-		pcall(writefile, PERSIST_FILE, encoded)
+		local wrote, werr = pcall(writefile, PERSIST_FILE, encoded)
+		if not wrote then
+			-- a silent write failure looks exactly like "the cache is not saving"
+			PERSIST.writeFails = (PERSIST.writeFails or 0) + 1
+			if PERSIST.writeFails <= 3 or PERSIST.writeFails % 25 == 0 then
+				warn(("[JJ] writefile failed (#%d): %s"):format(PERSIST.writeFails, tostring(werr)))
+			end
+		elseif PERSIST.writeFails and PERSIST.writeFails > 0 then
+			PERSIST.writeFails = 0
+		end
 	end
 end
 
@@ -1492,6 +1501,11 @@ local function persist_load()
 		return nil, "none"
 	end
 
+	-- Order matters and an earlier version got it wrong: freshness used to
+	-- outrank content, so a two-entry teleportSetting beat a thirty-seven
+	-- entry teleportData just for being a few seconds newer. Within the same
+	-- place a fuller cache is always the better start, because stale entries
+	-- inside it are dropped by the TTL during restore anyway.
 	local best, bestScore = nil, nil
 	for _, c in ipairs(candidates) do
 		local sc = candidate_score(c)
@@ -1501,11 +1515,11 @@ local function persist_load()
 		elseif sc.matches ~= bestScore.matches then
 			-- a cache for this place always beats one for another place
 			better = sc.matches
-		elseif math.abs(sc.savedAt - bestScore.savedAt) > 5 then
-			better = sc.savedAt > bestScore.savedAt
-		else
-			-- saved at roughly the same moment: take the fuller one
+		elseif sc.richness ~= bestScore.richness then
 			better = sc.richness > bestScore.richness
+		else
+			-- equally full: take the newer one
+			better = sc.savedAt > bestScore.savedAt
 		end
 		if better then
 			best, bestScore = c, sc
@@ -1513,10 +1527,20 @@ local function persist_load()
 	end
 
 	if #candidates > 1 then
+		local now = os.time()
 		local parts = {}
 		for _, c in ipairs(candidates) do
 			local sc = candidate_score(c)
-			table.insert(parts, string.format("%s(%d,%s)", c.backend, sc.richness, sc.matches and "ok" or "other"))
+			table.insert(
+				parts,
+				string.format(
+					"%s(r%d,%ds,%s)",
+					c.backend,
+					sc.richness,
+					(sc.savedAt > 0) and (now - sc.savedAt) or -1,
+					sc.matches and "ok" or "other"
+				)
+			)
 		end
 		logf("RESTORE candidates: %s -> chose %s", table.concat(parts, " "), best.backend)
 	end
