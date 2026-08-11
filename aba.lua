@@ -1405,6 +1405,11 @@ local function persist_save(force)
 	if not PERSIST.enabled then
 		return
 	end
+
+	-- refuse to overwrite a saved cache with nothing at all
+	if timer_count() == 0 and #server_cache == 0 then
+		return
+	end
 	if not force and (tick() - PERSIST.lastSave) < 3 then
 		return
 	end
@@ -1429,42 +1434,94 @@ local function persist_save(force)
 	end
 end
 
+-- Every backend is read, then the best one wins. Returning the first hit was
+-- a real bug: a stale teleportSetting holding one timer beat the on-disk cache
+-- holding fifty, and because the placeId matched, that poor state was then
+-- written straight back over the good file.
+local function decode_candidate(raw, label, out)
+	if type(raw) ~= "string" or raw == "" then
+		return
+	end
+	local ok, decoded = pcall(function()
+		return HttpService:JSONDecode(raw)
+	end)
+	if ok and type(decoded) == "table" then
+		table.insert(out, { data = decoded, backend = label })
+	end
+end
+
+local function candidate_score(c)
+	local d = c.data
+	local timers_n = (type(d.timers) == "table") and #d.timers or 0
+	local servers_n = (type(d.servers) == "table") and #d.servers or 0
+	return {
+		matches = (d.placeId == game.PlaceId),
+		savedAt = tonumber(d.savedAt) or 0,
+		richness = timers_n * 2 + servers_n,
+	}
+end
+
 local function persist_load()
+	local candidates = {}
+
 	local ok, data = pcall(function()
 		return TeleportService:GetLocalPlayerTeleportData()
 	end)
 	if ok and type(data) == "table" and type(data.jobjoiner) == "table" then
-		return data.jobjoiner, "teleportData"
+		table.insert(candidates, { data = data.jobjoiner, backend = "teleportData" })
 	end
 
 	local ok2, raw = pcall(function()
 		return TeleportService:GetTeleportSetting(PERSIST_KEY)
 	end)
-	if ok2 and type(raw) == "string" and raw ~= "" then
-		local ok3, decoded = pcall(function()
-			return HttpService:JSONDecode(raw)
-		end)
-		if ok3 and type(decoded) == "table" then
-			return decoded, "teleportSetting"
-		end
+	if ok2 then
+		decode_candidate(raw, "teleportSetting", candidates)
 	end
 
 	if has_files() then
 		local okE, exists = pcall(isfile, PERSIST_FILE)
 		if okE and exists then
-			local ok4, raw2 = pcall(readfile, PERSIST_FILE)
-			if ok4 then
-				local ok5, decoded = pcall(function()
-					return HttpService:JSONDecode(raw2)
-				end)
-				if ok5 and type(decoded) == "table" then
-					return decoded, "file"
-				end
+			local ok3, body = pcall(readfile, PERSIST_FILE)
+			if ok3 then
+				decode_candidate(body, "file", candidates)
 			end
 		end
 	end
 
-	return nil, "none"
+	if #candidates == 0 then
+		return nil, "none"
+	end
+
+	local best, bestScore = nil, nil
+	for _, c in ipairs(candidates) do
+		local sc = candidate_score(c)
+		local better
+		if not best then
+			better = true
+		elseif sc.matches ~= bestScore.matches then
+			-- a cache for this place always beats one for another place
+			better = sc.matches
+		elseif math.abs(sc.savedAt - bestScore.savedAt) > 5 then
+			better = sc.savedAt > bestScore.savedAt
+		else
+			-- saved at roughly the same moment: take the fuller one
+			better = sc.richness > bestScore.richness
+		end
+		if better then
+			best, bestScore = c, sc
+		end
+	end
+
+	if #candidates > 1 then
+		local parts = {}
+		for _, c in ipairs(candidates) do
+			local sc = candidate_score(c)
+			table.insert(parts, string.format("%s(%d,%s)", c.backend, sc.richness, sc.matches and "ok" or "other"))
+		end
+		logf("RESTORE candidates: %s -> chose %s", table.concat(parts, " "), best.backend)
+	end
+
+	return best.data, best.backend
 end
 
 local function mark_visited(jobId)
