@@ -122,18 +122,19 @@ local GAME = {
 	HEARTBEAT = 15, -- seconds between forced history samples
 }
 
-
 --// auto entry: the client lands in the menu after every launch, and the
 --// payout world has to be opened before any timer or gold exists
 local ENTRY = {
 	enabled = true,
-	placeId = 0, -- lobby/menu place. 0 = click in any place
-	gui = "MainMenu", -- PlayerGui child holding the menu
-	button = "afkworld", -- descendant to click (searched recursively)
+	placeId = 0, -- lobby/menu place. 0 = act in any place
+	-- The menu button just calls TeleportService:Teleport(<id>), so we can do
+	-- that ourselves and skip the UI entirely. Set to 0 to click instead.
+	teleportTo = 5411459567, -- AFK world placeId
+	gui = "MainMenu", -- fallback: PlayerGui child holding the menu
+	button = "afkworld", -- fallback: descendant to click
 	timeout = 45, -- give up after this many seconds
-	retry = 2, -- seconds between click attempts
+	retry = 2, -- seconds between attempts
 }
-
 
 --// sliders / inputs
 local MIN_LEAD_MIN, MIN_LEAD_MAX = 1, 20
@@ -1066,11 +1067,7 @@ local function write_next_target(force)
 		return
 	end
 	-- line 1: JobId | line 2: rebuilds this client | line 3: placeId
-	pcall(
-		writefile,
-		CFG.TARGET_FILE,
-		id .. "\n" .. tostring(client_hops) .. "\n" .. tostring(game.PlaceId)
-	)
+	pcall(writefile, CFG.TARGET_FILE, id .. "\n" .. tostring(client_hops) .. "\n" .. tostring(game.PlaceId))
 end
 
 --// breadcrumb log: survives the crash, unlike anything held in memory
@@ -1416,6 +1413,21 @@ local function parse_seconds(txt)
 end
 
 --==============================================================
+--  TELEPORT STATE
+--  Declared before AUTO ENTRY because the entry teleport needs to observe
+--  TeleportInitFailed too.
+--==============================================================
+local teleport_failed = false
+local teleport_fail_reason = ""
+
+TeleportService.TeleportInitFailed:Connect(function(player, result, errorMessage)
+	if player == LocalPlayer then
+		teleport_failed = true
+		teleport_fail_reason = (errorMessage ~= "" and errorMessage) or tostring(result)
+	end
+end)
+
+--==============================================================
 --  AUTO ENTRY
 --==============================================================
 -- Two strategies, because neither works everywhere: firing the button's own
@@ -1588,6 +1600,58 @@ local function enter_afk_world()
 		return false
 	end
 
+	-- Preferred path: do exactly what the menu button does. No UI lookup, no
+	-- synthetic input, nothing to break if the game reskins its menu.
+	if ENTRY.teleportTo and ENTRY.teleportTo > 0 then
+		logf("ENTRY start | place %d | teleporting to %d", game.PlaceId, ENTRY.teleportTo)
+
+		local deadline = tick() + ENTRY.timeout
+		local tries = 0
+
+		while tick() < deadline do
+			if should_stop() then
+				return false
+			end
+			if in_afk_world() then
+				logf("ENTRY ok via teleport after %d try(s)", tries)
+				return true
+			end
+
+			tries += 1
+			teleport_failed, teleport_fail_reason = false, ""
+
+			local ok, err = pcall(function()
+				TeleportService:Teleport(ENTRY.teleportTo, LocalPlayer)
+			end)
+			if not ok then
+				logf("ENTRY teleport call failed: %s", tostring(err))
+			else
+				logf("ENTRY teleport #%d sent -> %d", tries, ENTRY.teleportTo)
+			end
+
+			-- give the teleport room to either take or report a failure
+			local wait_until = tick() + 8
+			while tick() < wait_until and not teleport_failed do
+				if in_afk_world() then
+					logf("ENTRY ok via teleport after %d try(s)", tries)
+					return true
+				end
+				task.wait(0.2)
+			end
+
+			if teleport_failed then
+				logf("ENTRY teleport rejected: %s", teleport_fail_reason)
+				if teleport_fail_reason:lower():find("flood") then
+					task.wait(10)
+				end
+			end
+
+			task.wait(ENTRY.retry)
+		end
+
+		logf("ENTRY teleport exhausted after %d try(s) — falling back to the button", tries)
+	end
+
 	logf("ENTRY start | place %d | looking for %s.%s", game.PlaceId, ENTRY.gui, ENTRY.button)
 
 	local deadline = tick() + ENTRY.timeout
@@ -1610,8 +1674,13 @@ local function enter_afk_world()
 		if btn then
 			attempts += 1
 			if attempts == 1 then
-				logf("ENTRY found %s | visible=%s | size=%dx%d", why,
-					tostring(btn.Visible), btn.AbsoluteSize.X, btn.AbsoluteSize.Y)
+				logf(
+					"ENTRY found %s | visible=%s | size=%dx%d",
+					why,
+					tostring(btn.Visible),
+					btn.AbsoluteSize.X,
+					btn.AbsoluteSize.Y
+				)
 			end
 			local how = click_button(btn, attempts)
 			logf("ENTRY click #%d via %s", attempts, how or "FAILED")
@@ -1630,8 +1699,7 @@ local function enter_afk_world()
 		task.wait(ENTRY.retry)
 	end
 
-	logf("ENTRY TIMEOUT after %ds (%d clicks) — still not in the AFK world",
-		ENTRY.timeout, attempts)
+	logf("ENTRY TIMEOUT after %ds (%d clicks) — still not in the AFK world", ENTRY.timeout, attempts)
 	library:Notify("Could not reach the AFK world automatically", "error", 8)
 	return false
 end
@@ -2044,19 +2112,6 @@ local function restore_cache()
 	return true, #restored, restoredTimers, math.max(0, age)
 end
 
---==============================================================
---  TELEPORT
---==============================================================
-local teleport_failed = false
-local teleport_fail_reason = ""
-
-TeleportService.TeleportInitFailed:Connect(function(player, result, errorMessage)
-	if player == LocalPlayer then
-		teleport_failed = true
-		teleport_fail_reason = (errorMessage ~= "" and errorMessage) or tostring(result)
-	end
-end)
-
 local function extract_job_id(txt)
 	txt = tostring(txt or ""):gsub("%s+", "")
 	local fromUrl = txt:match("gameInstanceId=([%w%-]+)")
@@ -2426,11 +2481,7 @@ local function auto_loop()
 
 		-- optional runtime limit
 		if CFG.AUTO_MAX_HOURS > 0 and auto_runtime() >= CFG.AUTO_MAX_HOURS * 3600 then
-			library:Notify(
-				string.format("Ran for %s — auto off (time limit)", dur(auto_runtime())),
-				"warn",
-				10
-			)
+			library:Notify(string.format("Ran for %s — auto off (time limit)", dur(auto_runtime())), "warn", 10)
 			auto_enabled = false
 			persist_save(true)
 			break
@@ -2612,13 +2663,7 @@ local function toggle_auto(force)
 	if auto_enabled then
 		local limit = (CFG.AUTO_MAX_HOURS > 0) and string.format(", limit %gh", CFG.AUTO_MAX_HOURS) or ""
 		library:Notify(
-			string.format(
-				"Auto ON — pool %d, lead %ds, window +%ds%s",
-				explore_target,
-				min_lead,
-				hop_window,
-				limit
-			),
+			string.format("Auto ON — pool %d, lead %ds, window +%ds%s", explore_target, min_lead, hop_window, limit),
 			"ok"
 		)
 		task.spawn(auto_loop)
