@@ -95,15 +95,17 @@ local GRAPH_POINTS = 48 -- bars drawn in the sparkline
 --// tuning (grouped: Luau caps a function at 200 locals)
 local CFG = {
 	DISK_INTERVAL = 20, -- min seconds between writefile calls
-	EXPLORE_COOLDOWN = 0, -- pause between exploration hops
+	EXPLORE_COOLDOWN = 3, -- pause between exploration hops
 	MAX_EXPLORE_FAILS = 3, -- give up exploring after this many empty picks
+	API_COOLDOWNS = { 30, 60, 120, 300 }, -- escalating pause after a 429
+	API_RETRIES = 1, -- in-call retries before deferring to the cooldown
 	AUTO_MAX_HOURS = 0, -- stop auto after N hours (0 = run forever)
 	MEM_GROWTH_MB = 400, -- pause when Lua heap grows this much past baseline
 	MEM_PAUSE_SECS = 30, -- how long to idle while memory settles
 	MEM_GIVEUP_MIN = 10, -- turn auto off if memory never recovers in N minutes
-	MIN_HOP_INTERVAL = 0, -- hard floor in seconds between teleports (0 = off)
+	MIN_HOP_INTERVAL = 25, -- hard floor in seconds between teleports (0 = off)
 	LOW_GRAPHICS = true, -- force the lowest quality level on every join
-	DISABLE_3D = true, -- stop rendering the world entirely (GUI still shows)
+	DISABLE_3D = false, -- stop rendering the world entirely (GUI still shows)
 	LOG_FILE = "jobjoiner_log.txt", -- crash breadcrumbs (executor only)
 	LOG_MAX_KB = 512, -- rotate the log past this size
 	TARGET_FILE = "next_target.txt", -- where the AHK watchdog should rejoin
@@ -976,11 +978,46 @@ local function get_request_fn()
 	return ok and fn or nil
 end
 
+-- Roblox's server-list endpoint bans hard and stays banned if you keep
+-- knocking. Retrying inside a single call is not enough: the whole script has
+-- to stop touching the API for a while, with the pause growing each time.
+local API = { blockedUntil = 0, strikes = 0 }
+
+local function api_cooldown_left()
+	return math.max(0, API.blockedUntil - tick())
+end
+
+-- logf lives further down; API.report is wired up once it exists
+local function api_penalise()
+	API.strikes = math.min(API.strikes + 1, #CFG.API_COOLDOWNS)
+	local secs = CFG.API_COOLDOWNS[API.strikes]
+	API.blockedUntil = tick() + secs
+	if API.report then
+		API.report("API rate limited — pausing all requests for %ds (strike %d)", secs, API.strikes)
+	else
+		warn(("[HTTP] rate limited, pausing %ds (strike %d)"):format(secs, API.strikes))
+	end
+	return secs
+end
+
+local function api_forgive()
+	if API.strikes > 0 and API.report then
+		API.report("API recovered after %d strike(s)", API.strikes)
+	end
+	API.strikes = 0
+	API.blockedUntil = 0
+end
+
 local function get_json(url, retries)
-	retries = retries or 2
+	retries = retries or CFG.API_RETRIES
 	local req = get_request_fn()
 	if not req then
 		return nil, "no HTTP function (executor required)"
+	end
+
+	local left = api_cooldown_left()
+	if left > 0 then
+		return nil, string.format("rate limited, %ds left", math.ceil(left))
 	end
 
 	for attempt = 1, retries + 1 do
@@ -993,15 +1030,18 @@ local function get_json(url, retries)
 					return HttpService:JSONDecode(res.Body)
 				end)
 				if ok2 then
+					api_forgive()
 					return data
 				end
 				return nil, "invalid JSON response"
 			end
 
-			if code == 429 and attempt <= retries then
-				local waitTime = attempt * 3
-				warn(("[HTTP] rate limited, retrying in %ds"):format(waitTime))
-				task.wait(waitTime)
+			if code == 429 then
+				if attempt > retries then
+					local secs = api_penalise()
+					return nil, string.format("rate limited, backing off %ds", secs)
+				end
+				task.wait(3)
 			else
 				return nil, "HTTP " .. tostring(code)
 			end
@@ -1010,7 +1050,8 @@ local function get_json(url, retries)
 		end
 	end
 
-	return nil, "rate limited (429)"
+	local secs = api_penalise()
+	return nil, string.format("rate limited, backing off %ds", secs)
 end
 
 --==============================================================
@@ -1133,6 +1174,8 @@ local function logf(fmt, ...)
 		log_rotate()
 	end
 end
+
+API.report = logf
 
 local function timer_count()
 	local n = 0
@@ -1909,6 +1952,11 @@ local function fetch_cache(ignoreVisited)
 		return false, "no HTTP function (executor required)"
 	end
 
+	local left = api_cooldown_left()
+	if left > 0 then
+		return false, string.format("API cooling down, %ds left", math.ceil(left))
+	end
+
 	local collected, seen = {}, {}
 	local cursor, pages_done = nil, 0
 	local lastErr = nil
@@ -2431,6 +2479,11 @@ local function pick_explore_target()
 		return s
 	end
 
+	-- never widen the search while the API is punishing us
+	if api_cooldown_left() > 0 then
+		return nil
+	end
+
 	if get_request_fn() then
 		set_auto_status("fetching")
 		if fetch_cache() then
@@ -2536,7 +2589,9 @@ local function auto_loop()
 		prune_timers()
 
 		-- BOOTSTRAP: grow the pool with random unsampled servers first
-		if timer_count() < explore_target then
+		-- while the API is banned there is nothing new to discover, so fall
+		-- through to the timed logic and work the pool we already have
+		if timer_count() < explore_target and api_cooldown_left() <= 0 then
 			if not timers[game.JobId] then
 				set_auto_status("sampling")
 				task.wait(0.25)
@@ -3124,7 +3179,7 @@ do
 			write_next_target(true)
 			if auto_enabled then
 				logf(
-					"GAME.HEARTBEAT runtime %s | hops %d | pool %d | gold %s",
+					"HEARTBEAT runtime %s | hops %d | pool %d | gold %s",
 					dur(auto_runtime()),
 					stats.hops,
 					timer_count(),
