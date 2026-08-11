@@ -1421,37 +1421,49 @@ end
 -- Two strategies, because neither works everywhere: firing the button's own
 -- connections is exact but needs executor support; a synthetic mouse click
 -- works anywhere but depends on the button being visible on screen.
-local function click_button(btn)
-	local fired = false
+-- Fire whatever the game actually listens to. GuiButtons expose click
+-- signals; plain Frames and Labels are usually driven by InputBegan, which
+-- needs a real InputObject, so those fall through to the synthetic click.
+local function fire_connections(obj)
+	if not getconnections then
+		return 0
+	end
 
-	if getconnections then
-		for _, signal in ipairs({ "MouseButton1Click", "Activated", "MouseButton1Down" }) do
-			local ok, conns = pcall(function()
-				return getconnections(btn[signal])
-			end)
-			if ok and conns then
-				for _, c in ipairs(conns) do
-					pcall(function()
-						c:Fire()
-					end)
-					fired = true
+	local count = 0
+	for _, signal in ipairs({
+		"MouseButton1Click",
+		"Activated",
+		"MouseButton1Down",
+		"MouseButton1Up",
+	}) do
+		local ok, conns = pcall(function()
+			return getconnections(obj[signal])
+		end)
+		if ok and conns then
+			for _, c in ipairs(conns) do
+				if pcall(function()
+					c:Fire()
+				end) then
+					count += 1
 				end
 			end
 		end
 	end
+	return count
+end
 
-	if fired then
-		return "connections"
-	end
-
-	-- fallback: synthetic click at the button's centre
-	local ok = pcall(function()
+local function virtual_click(obj)
+	return pcall(function()
 		local vim = game:GetService("VirtualInputManager")
-		local pos, size = btn.AbsolutePosition, btn.AbsoluteSize
+		local pos, size = obj.AbsolutePosition, obj.AbsoluteSize
+
+		if size.X < 1 or size.Y < 1 then
+			error("zero-sized target")
+		end
 
 		-- AbsolutePosition excludes the topbar unless the ScreenGui ignores it
 		local insetY = 0
-		local screen = btn:FindFirstAncestorWhichIsA("ScreenGui")
+		local screen = obj:FindFirstAncestorWhichIsA("ScreenGui")
 		if screen and not screen.IgnoreGuiInset then
 			insetY = game:GetService("GuiService"):GetGuiInset().Y
 		end
@@ -1459,36 +1471,93 @@ local function click_button(btn)
 		local x = pos.X + size.X / 2
 		local y = pos.Y + size.Y / 2 + insetY
 
-		vim:SendMouseButtonEvent(x, y, 0, true, game, 1)
+		-- move first: some UIs only accept a click after a hover
+		vim:SendMouseMoveEvent(x, y, game)
+		task.wait(0.05)
+		vim:SendMouseButtonEvent(x, y, 0, true, game, 0)
 		task.wait(0.06)
-		vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
+		vim:SendMouseButtonEvent(x, y, 0, false, game, 0)
 	end)
+end
 
-	return ok and "virtual" or nil
+-- attempt 1-2 use connections (exact), 3+ force the synthetic click
+local function click_button(obj, attempt)
+	if attempt <= 2 then
+		local n = fire_connections(obj)
+		if n > 0 then
+			return string.format("connections x%d", n)
+		end
+	end
+
+	if virtual_click(obj) then
+		return "virtual"
+	end
+
+	local n = fire_connections(obj)
+	if n > 0 then
+		return string.format("connections x%d", n)
+	end
+
+	return nil
 end
 
 local function find_entry_button()
 	local pg = LocalPlayer:FindFirstChild("PlayerGui")
 	if not pg then
-		return nil
+		return nil, nil, "no PlayerGui"
 	end
-	local menu = pg:FindFirstChild(ENTRY.gui)
+
+	-- recursive: the menu is not always a direct child
+	local menu = pg:FindFirstChild(ENTRY.gui) or pg:FindFirstChild(ENTRY.gui, true)
 	if not menu then
-		return nil
+		return nil, nil, "no '" .. ENTRY.gui .. "' in PlayerGui"
 	end
-	local btn = menu:FindFirstChild(ENTRY.button, true)
-	if btn and btn:IsA("GuiButton") then
-		return btn, menu
+
+	local target = menu:FindFirstChild(ENTRY.button, true)
+	if not target then
+		return nil, menu, "no '" .. ENTRY.button .. "' under " .. ENTRY.gui
 	end
-	-- some menus wrap the button in a frame of the same name
-	if btn then
-		for _, d in ipairs(btn:GetDescendants()) do
-			if d:IsA("GuiButton") then
-				return d, menu
-			end
+
+	-- a GuiButton is ideal, but plenty of menus use a Frame or ImageLabel
+	-- wired up through InputBegan; those are still clickable positionally
+	if target:IsA("GuiButton") then
+		return target, menu, "GuiButton"
+	end
+
+	for _, d in ipairs(target:GetDescendants()) do
+		if d:IsA("GuiButton") then
+			return d, menu, "GuiButton (child of " .. target.ClassName .. ")"
 		end
 	end
-	return nil, menu
+
+	if target:IsA("GuiObject") then
+		return target, menu, target.ClassName .. " (positional click only)"
+	end
+
+	return nil, menu, "'" .. ENTRY.button .. "' is a " .. target.ClassName .. ", not clickable"
+end
+
+-- printed once when the button cannot be found, to make misconfiguration obvious
+local function dump_menu(menu)
+	if not menu then
+		local pg = LocalPlayer:FindFirstChild("PlayerGui")
+		if pg then
+			local names = {}
+			for _, c in ipairs(pg:GetChildren()) do
+				table.insert(names, c.Name .. "(" .. c.ClassName .. ")")
+			end
+			logf("ENTRY debug | PlayerGui children: %s", table.concat(names, ", "))
+		end
+		return
+	end
+
+	local names = {}
+	for _, d in ipairs(menu:GetDescendants()) do
+		if d:IsA("GuiObject") and #names < 40 then
+			table.insert(names, d.Name .. "(" .. d.ClassName .. ")")
+		end
+	end
+	logf("ENTRY debug | %s contains: %s", menu.Name, table.concat(names, ", "))
 end
 
 -- the world is loaded once the countdown exists
@@ -1519,8 +1588,12 @@ local function enter_afk_world()
 		return false
 	end
 
+	logf("ENTRY start | place %d | looking for %s.%s", game.PlaceId, ENTRY.gui, ENTRY.button)
+
 	local deadline = tick() + ENTRY.timeout
 	local attempts = 0
+	local dumped = false
+	local lastWhy = nil
 
 	while tick() < deadline do
 		if should_stop() then
@@ -1528,20 +1601,37 @@ local function enter_afk_world()
 		end
 		if in_afk_world() then
 			logf("ENTRY ok after %d attempt(s)", attempts)
+			library:Notify("AFK world reached", "ok")
 			return true
 		end
 
-		local btn = find_entry_button()
-		if btn and btn.Visible ~= false then
+		local btn, menu, why = find_entry_button()
+
+		if btn then
 			attempts += 1
-			local how = click_button(btn)
-			logf("ENTRY click #%d via %s", attempts, how or "failed")
+			if attempts == 1 then
+				logf("ENTRY found %s | visible=%s | size=%dx%d", why,
+					tostring(btn.Visible), btn.AbsoluteSize.X, btn.AbsoluteSize.Y)
+			end
+			local how = click_button(btn, attempts)
+			logf("ENTRY click #%d via %s", attempts, how or "FAILED")
+		else
+			if why ~= lastWhy then
+				logf("ENTRY waiting: %s", tostring(why))
+				lastWhy = why
+			end
+			-- after a few seconds of not finding it, show what IS there
+			if not dumped and (tick() > deadline - ENTRY.timeout + 6) then
+				dumped = true
+				dump_menu(menu)
+			end
 		end
 
 		task.wait(ENTRY.retry)
 	end
 
-	logf("ENTRY TIMEOUT after %ds — still not in the AFK world", ENTRY.timeout)
+	logf("ENTRY TIMEOUT after %ds (%d clicks) — still not in the AFK world",
+		ENTRY.timeout, attempts)
 	library:Notify("Could not reach the AFK world automatically", "error", 8)
 	return false
 end
