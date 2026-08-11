@@ -1217,8 +1217,14 @@ end
 --// should come back to. Written to disk so it survives the process.
 local last_target_write = 0
 
+-- `ready` stays false until restore_cache() has run. watch_hint is spawned
+-- well before the BOOT block, so the very first timer reading used to fire
+-- persist_save with an empty cache and overwrite the saved state within a
+-- second of injecting — which is why the file never held more than one timer.
+local PERSIST = { enabled = true, ready = false, lastSave = 0, lastDisk = 0 }
+
 local function write_next_target(force)
-	if not has_files() then
+	if not has_files() or not PERSIST.ready then
 		return
 	end
 
@@ -1399,10 +1405,9 @@ end
 -- Writing is disabled until we know this place owns the cache. Booting in the
 -- lobby used to overwrite the farm's saved pool with an empty default state,
 -- which is why a client restart came back with nothing.
-local PERSIST = { enabled = true, lastSave = 0, lastDisk = 0 }
 
 local function persist_save(force)
-	if not PERSIST.enabled then
+	if not PERSIST.enabled or not PERSIST.ready then
 		return
 	end
 
@@ -3442,6 +3447,10 @@ do
 	if ui_state.tab and pages[ui_state.tab] then
 		select_tab(ui_state.tab, false)
 	end
+
+	-- restore is complete: writing is safe from here on
+	PERSIST.ready = true
+	persist_save(true)
 
 	render_auto_button()
 	render_servers()
