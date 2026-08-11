@@ -111,6 +111,8 @@ local CFG = {
 	TARGET_FILE = "next_target.txt", -- where the AHK watchdog should rejoin
 	TARGET_INTERVAL = 20, -- seconds between target file writes
 	UI_FILE = "jobjoiner_ui.json", -- window position / minimised state
+	BEAT_FILE = "jobjoiner_beat.json", -- liveness signal for the watchdog
+	BEAT_INTERVAL = 10, -- seconds between heartbeats
 }
 
 --// game-specific hooks (grouped: Luau caps a function at 200 locals)
@@ -125,7 +127,6 @@ local GAME = {
 	HEARTBEAT = 15, -- seconds between forced history samples
 }
 
-
 --// auto entry: the client lands in the menu after every launch, and the
 --// payout world has to be opened before any timer or gold exists
 local ENTRY = {
@@ -139,7 +140,6 @@ local ENTRY = {
 	timeout = 45, -- give up after this many seconds
 	retry = 2, -- seconds between attempts
 }
-
 
 --// sliders / inputs
 local MIN_LEAD_MIN, MIN_LEAD_MAX = 1, 20
@@ -1016,8 +1016,12 @@ UserInputService.InputChanged:Connect(function(input)
 		end
 		if DRAG.active then
 			local d = input.Position - DRAG.start
-			main.Position =
-				UDim2.new(DRAG.origin.X.Scale, DRAG.origin.X.Offset + d.X, DRAG.origin.Y.Scale, DRAG.origin.Y.Offset + d.Y)
+			main.Position = UDim2.new(
+				DRAG.origin.X.Scale,
+				DRAG.origin.X.Offset + d.X,
+				DRAG.origin.Y.Scale,
+				DRAG.origin.Y.Offset + d.Y
+			)
 		end
 	end
 end)
@@ -1043,11 +1047,9 @@ local function apply_minimized(state, animate)
 
 	local target = minimized and COLLAPSED or EXPANDED
 	if animate then
-		TweenService:Create(
-			main,
-			TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-			{ Size = target }
-		):Play()
+		TweenService
+			:Create(main, TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Size = target })
+			:Play()
 	else
 		main.Size = target
 	end
@@ -1223,6 +1225,44 @@ local last_target_write = 0
 -- second of injecting — which is why the file never held more than one timer.
 local PERSIST = { enabled = true, ready = false, lastSave = 0, lastDisk = 0 }
 
+-- Liveness signal, deliberately unconditional: it is written from the lobby,
+-- before restore, and while the API is cooling down. Its only job is to prove
+-- that Lua is still executing. Error 279 leaves the process alive behind a
+-- modal dialog, so "is the process running" cannot detect that state - but a
+-- heartbeat that stops updating can.
+local function write_heartbeat()
+	if not (writefile and HttpService) then
+		return
+	end
+
+	local payload = {
+		t = os.time(),
+		place = game.PlaceId,
+		job = game.JobId,
+		rebuilds = client_hops or 0,
+		auto = auto_enabled == true,
+		gold = stats and stats.lastGold or nil,
+		claims = stats and stats.claims or 0,
+		lastClaim = stats and stats.lastClaimAt or nil,
+		pool = 0,
+		status = auto_status,
+	}
+
+	-- timer_count() is defined further down, so count inline here
+	local pool = 0
+	for _ in pairs(timers) do
+		pool += 1
+	end
+	payload.pool = pool
+
+	local ok, encoded = pcall(function()
+		return HttpService:JSONEncode(payload)
+	end)
+	if ok then
+		pcall(writefile, CFG.BEAT_FILE, encoded)
+	end
+end
+
 local function write_next_target(force)
 	if not has_files() or not PERSIST.ready then
 		return
@@ -1244,11 +1284,7 @@ local function write_next_target(force)
 		return
 	end
 	-- line 1: JobId | line 2: rebuilds this client | line 3: placeId
-	pcall(
-		writefile,
-		CFG.TARGET_FILE,
-		id .. "\n" .. tostring(client_hops) .. "\n" .. tostring(game.PlaceId)
-	)
+	pcall(writefile, CFG.TARGET_FILE, id .. "\n" .. tostring(client_hops) .. "\n" .. tostring(game.PlaceId))
 end
 
 --// breadcrumb log: survives the crash, unlike anything held in memory
@@ -1944,8 +1980,13 @@ local function enter_afk_world()
 		if btn then
 			attempts += 1
 			if attempts == 1 then
-				logf("ENTRY found %s | visible=%s | size=%dx%d", why,
-					tostring(btn.Visible), btn.AbsoluteSize.X, btn.AbsoluteSize.Y)
+				logf(
+					"ENTRY found %s | visible=%s | size=%dx%d",
+					why,
+					tostring(btn.Visible),
+					btn.AbsoluteSize.X,
+					btn.AbsoluteSize.Y
+				)
 			end
 			local how = click_button(btn, attempts)
 			logf("ENTRY click #%d via %s", attempts, how or "FAILED")
@@ -1964,8 +2005,7 @@ local function enter_afk_world()
 		task.wait(ENTRY.retry)
 	end
 
-	logf("ENTRY TIMEOUT after %ds (%d clicks) — still not in the AFK world",
-		ENTRY.timeout, attempts)
+	logf("ENTRY TIMEOUT after %ds (%d clicks) — still not in the AFK world", ENTRY.timeout, attempts)
 	library:Notify("Could not reach the AFK world automatically", "error", 8)
 	return false
 end
@@ -2045,6 +2085,7 @@ local function record_gold(gold)
 
 	if prev and gold > prev then
 		local delta = gold - prev
+		stats.lastClaimAt = os.time()
 		stats.claims += 1
 		stats.claimTotal += delta
 		if delta > stats.bestClaim then
@@ -2459,8 +2500,7 @@ local function attempt_join(jobId, timeoutSecs, isExplore)
 
 	-- one teleport at a time, no matter how many coroutines ask
 	if teleport_locked() then
-		return false,
-			string.format("teleport in flight (%.0fs left)", TP.LOCK_TTL - (tick() - TP.inFlightAt))
+		return false, string.format("teleport in flight (%.0fs left)", TP.LOCK_TTL - (tick() - TP.inFlightAt))
 	end
 	TP.inFlightAt = tick()
 
@@ -2794,11 +2834,7 @@ local function auto_loop()
 
 		-- optional runtime limit
 		if CFG.AUTO_MAX_HOURS > 0 and auto_runtime() >= CFG.AUTO_MAX_HOURS * 3600 then
-			library:Notify(
-				string.format("Ran for %s — auto off (time limit)", dur(auto_runtime())),
-				"warn",
-				10
-			)
+			library:Notify(string.format("Ran for %s — auto off (time limit)", dur(auto_runtime())), "warn", 10)
 			auto_enabled = false
 			persist_save(true)
 			break
@@ -2993,13 +3029,7 @@ local function toggle_auto(force)
 	if auto_enabled then
 		local limit = (CFG.AUTO_MAX_HOURS > 0) and string.format(", limit %gh", CFG.AUTO_MAX_HOURS) or ""
 		library:Notify(
-			string.format(
-				"Auto ON — pool %d, lead %ds, window +%ds%s",
-				explore_target,
-				min_lead,
-				hop_window,
-				limit
-			),
+			string.format("Auto ON — pool %d, lead %ds, window +%ds%s", explore_target, min_lead, hop_window, limit),
 			"ok"
 		)
 		task.spawn(auto_loop)
@@ -3451,6 +3481,7 @@ do
 	-- restore is complete: writing is safe from here on
 	PERSIST.ready = true
 	persist_save(true)
+	write_heartbeat()
 
 	render_auto_button()
 	render_servers()
@@ -3508,6 +3539,15 @@ do
 	end)
 
 	-- periodic heartbeat so a crash leaves a fresh memory reading behind
+	-- fast, independent loop: it must keep ticking even if the auto logic is
+	-- stuck, otherwise the watchdog cannot tell the difference
+	task.spawn(function()
+		while gui.Parent and not should_stop() do
+			write_heartbeat()
+			task.wait(CFG.BEAT_INTERVAL)
+		end
+	end)
+
 	task.spawn(function()
 		while gui.Parent do
 			task.wait(60)
