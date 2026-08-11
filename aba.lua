@@ -99,9 +99,9 @@ local CFG = {
 	MAX_EXPLORE_FAILS = 3, -- give up exploring after this many empty picks
 	AUTO_MAX_HOURS = 0, -- stop auto after N hours (0 = run forever)
 	MEM_GROWTH_MB = 400, -- pause when Lua heap grows this much past baseline
-	MEM_PAUSE_SECS = 1, -- how long to idle while memory settles
+	MEM_PAUSE_SECS = 30, -- how long to idle while memory settles
 	MEM_GIVEUP_MIN = 10, -- turn auto off if memory never recovers in N minutes
-	MIN_HOP_INTERVAL = 1, -- hard floor in seconds between teleports (0 = off)
+	MIN_HOP_INTERVAL = 25, -- hard floor in seconds between teleports (0 = off)
 	LOW_GRAPHICS = true, -- force the lowest quality level on every join
 	DISABLE_3D = false, -- stop rendering the world entirely (GUI still shows)
 	LOG_FILE = "jobjoiner_log.txt", -- crash breadcrumbs (executor only)
@@ -110,17 +110,30 @@ local CFG = {
 	TARGET_INTERVAL = 20, -- seconds between target file writes
 }
 
---// timer tracking
-local HINT_NAME = "Message" -- workspace child holding the countdown
-local CYCLE = 30 -- countdown length in seconds
-local TIMER_OFFSET = 1 -- display rounds down; add this to each reading
-local TIMER_TTL = 3600 -- forget a phase after this many seconds
+--// game-specific hooks (grouped: Luau caps a function at 200 locals)
+local GAME = {
+	HINT_NAME = "Message", -- workspace child holding the countdown
+	CYCLE = 30, -- countdown length in seconds
+	TIMER_OFFSET = 1, -- display rounds down; add this to each reading
+	TIMER_TTL = 3600, -- forget a phase after this many seconds
+	MONEY_GUI = "ScreenGui", -- PlayerGui child holding the labels
+	MONEY_LABEL = "TextLabel", -- "Gold : $1321"
+	LEVEL_LABEL = "TextLabel2", -- "Level : 30"
+	HEARTBEAT = 15, -- seconds between forced history samples
+}
 
---// money tracking
-local MONEY_GUI = "ScreenGui" -- PlayerGui child holding the labels
-local MONEY_LABEL = "TextLabel" -- "Gold : $1321"
-local LEVEL_LABEL = "TextLabel2" -- "Level : 30"
-local HEARTBEAT = 15 -- seconds between forced history samples
+
+--// auto entry: the client lands in the menu after every launch, and the
+--// payout world has to be opened before any timer or gold exists
+local ENTRY = {
+	enabled = true,
+	placeId = 0, -- lobby/menu place. 0 = click in any place
+	gui = "MainMenu", -- PlayerGui child holding the menu
+	button = "afkworld", -- descendant to click (searched recursively)
+	timeout = 45, -- give up after this many seconds
+	retry = 2, -- seconds between click attempts
+}
+
 
 --// sliders / inputs
 local MIN_LEAD_MIN, MIN_LEAD_MAX = 1, 20
@@ -1052,8 +1065,12 @@ local function write_next_target(force)
 	if id == "" then
 		return
 	end
-	-- line 1: where to rejoin | line 2: hops since this client launched
-	pcall(writefile, CFG.TARGET_FILE, id .. "\n" .. tostring(client_hops))
+	-- line 1: JobId | line 2: rebuilds this client | line 3: placeId
+	pcall(
+		writefile,
+		CFG.TARGET_FILE,
+		id .. "\n" .. tostring(client_hops) .. "\n" .. tostring(game.PlaceId)
+	)
 end
 
 --// breadcrumb log: survives the crash, unlike anything held in memory
@@ -1124,9 +1141,9 @@ end
 
 -- remaining seconds on a known server, at time t
 local function remaining_at(phase, t)
-	local r = (phase - t) % CYCLE
+	local r = (phase - t) % GAME.CYCLE
 	if r <= 0.001 then
-		r = CYCLE
+		r = GAME.CYCLE
 	end
 	return r
 end
@@ -1315,13 +1332,13 @@ local function record_timer(jobId, remaining, playing, maxP)
 	if not jobId or jobId == "" then
 		return
 	end
-	if type(remaining) ~= "number" or remaining < 0 or remaining > CYCLE + 2 then
+	if type(remaining) ~= "number" or remaining < 0 or remaining > GAME.CYCLE + 2 then
 		return
 	end
 
 	local t = now_secs()
 	local entry = timers[jobId] or { samples = 0 }
-	entry.phase = (t + remaining) % CYCLE
+	entry.phase = (t + remaining) % GAME.CYCLE
 	entry.samples = (entry.samples or 0) + 1
 	entry.seenAt = t
 	entry.playing = playing or entry.playing
@@ -1335,7 +1352,7 @@ end
 local function prune_timers()
 	local t = now_secs()
 	for id, e in pairs(timers) do
-		if (t - (e.seenAt or 0)) > TIMER_TTL then
+		if (t - (e.seenAt or 0)) > GAME.TIMER_TTL then
 			timers[id] = nil
 		end
 	end
@@ -1398,12 +1415,143 @@ local function parse_seconds(txt)
 	return n and tonumber(n) or nil
 end
 
+--==============================================================
+--  AUTO ENTRY
+--==============================================================
+-- Two strategies, because neither works everywhere: firing the button's own
+-- connections is exact but needs executor support; a synthetic mouse click
+-- works anywhere but depends on the button being visible on screen.
+local function click_button(btn)
+	local fired = false
+
+	if getconnections then
+		for _, signal in ipairs({ "MouseButton1Click", "Activated", "MouseButton1Down" }) do
+			local ok, conns = pcall(function()
+				return getconnections(btn[signal])
+			end)
+			if ok and conns then
+				for _, c in ipairs(conns) do
+					pcall(function()
+						c:Fire()
+					end)
+					fired = true
+				end
+			end
+		end
+	end
+
+	if fired then
+		return "connections"
+	end
+
+	-- fallback: synthetic click at the button's centre
+	local ok = pcall(function()
+		local vim = game:GetService("VirtualInputManager")
+		local pos, size = btn.AbsolutePosition, btn.AbsoluteSize
+
+		-- AbsolutePosition excludes the topbar unless the ScreenGui ignores it
+		local insetY = 0
+		local screen = btn:FindFirstAncestorWhichIsA("ScreenGui")
+		if screen and not screen.IgnoreGuiInset then
+			insetY = game:GetService("GuiService"):GetGuiInset().Y
+		end
+
+		local x = pos.X + size.X / 2
+		local y = pos.Y + size.Y / 2 + insetY
+
+		vim:SendMouseButtonEvent(x, y, 0, true, game, 1)
+		task.wait(0.06)
+		vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
+	end)
+
+	return ok and "virtual" or nil
+end
+
+local function find_entry_button()
+	local pg = LocalPlayer:FindFirstChild("PlayerGui")
+	if not pg then
+		return nil
+	end
+	local menu = pg:FindFirstChild(ENTRY.gui)
+	if not menu then
+		return nil
+	end
+	local btn = menu:FindFirstChild(ENTRY.button, true)
+	if btn and btn:IsA("GuiButton") then
+		return btn, menu
+	end
+	-- some menus wrap the button in a frame of the same name
+	if btn then
+		for _, d in ipairs(btn:GetDescendants()) do
+			if d:IsA("GuiButton") then
+				return d, menu
+			end
+		end
+	end
+	return nil, menu
+end
+
+-- the world is loaded once the countdown exists
+local function in_afk_world()
+	return workspace:FindFirstChild(GAME.HINT_NAME) ~= nil
+end
+
+-- are we sitting in the menu place the watchdog relaunches into?
+local function in_entry_place()
+	if not ENTRY.enabled then
+		return false
+	end
+	if ENTRY.placeId == 0 then
+		return true -- unconfigured: try everywhere
+	end
+	return game.PlaceId == ENTRY.placeId
+end
+
+local function enter_afk_world()
+	if not ENTRY.enabled then
+		return true
+	end
+	if in_afk_world() then
+		return true
+	end
+	if not in_entry_place() then
+		logf("ENTRY skipped: placeId %d is not the menu place (%d)", game.PlaceId, ENTRY.placeId)
+		return false
+	end
+
+	local deadline = tick() + ENTRY.timeout
+	local attempts = 0
+
+	while tick() < deadline do
+		if should_stop() then
+			return false
+		end
+		if in_afk_world() then
+			logf("ENTRY ok after %d attempt(s)", attempts)
+			return true
+		end
+
+		local btn = find_entry_button()
+		if btn and btn.Visible ~= false then
+			attempts += 1
+			local how = click_button(btn)
+			logf("ENTRY click #%d via %s", attempts, how or "failed")
+		end
+
+		task.wait(ENTRY.retry)
+	end
+
+	logf("ENTRY TIMEOUT after %ds — still not in the AFK world", ENTRY.timeout)
+	library:Notify("Could not reach the AFK world automatically", "error", 8)
+	return false
+end
+
 local function watch_hint()
-	local hint = workspace:FindFirstChild(HINT_NAME)
+	local hint = workspace:FindFirstChild(GAME.HINT_NAME)
 	if not hint then
 		local t0 = tick()
 		while tick() - t0 < 30 do
-			hint = workspace:FindFirstChild(HINT_NAME)
+			hint = workspace:FindFirstChild(GAME.HINT_NAME)
 			if hint then
 				break
 			end
@@ -1411,7 +1559,7 @@ local function watch_hint()
 		end
 	end
 	if not hint then
-		warn("[TIMER] no '" .. HINT_NAME .. "' found in workspace")
+		warn("[TIMER] no '" .. GAME.HINT_NAME .. "' found in workspace")
 		return
 	end
 
@@ -1420,7 +1568,7 @@ local function watch_hint()
 		if not r then
 			return
 		end
-		live_remaining = r + TIMER_OFFSET
+		live_remaining = r + GAME.TIMER_OFFSET
 		record_timer(game.JobId, live_remaining, #Players:GetPlayers(), Players.MaxPlayers)
 	end
 
@@ -1495,19 +1643,19 @@ local function watch_money()
 	local sg
 	local t0 = tick()
 	while tick() - t0 < 30 do
-		sg = pg:FindFirstChild(MONEY_GUI)
+		sg = pg:FindFirstChild(GAME.MONEY_GUI)
 		if sg then
 			break
 		end
 		task.wait(0.5)
 	end
 	if not sg then
-		warn("[MONEY] no '" .. MONEY_GUI .. "' found in PlayerGui")
+		warn("[MONEY] no '" .. GAME.MONEY_GUI .. "' found in PlayerGui")
 		return
 	end
 
-	local goldLbl = sg:FindFirstChild(MONEY_LABEL, true)
-	local lvlLbl = sg:FindFirstChild(LEVEL_LABEL, true)
+	local goldLbl = sg:FindFirstChild(GAME.MONEY_LABEL, true)
+	local lvlLbl = sg:FindFirstChild(GAME.LEVEL_LABEL, true)
 
 	if goldLbl then
 		record_gold(parse_number(goldLbl.Text))
@@ -1516,7 +1664,7 @@ local function watch_money()
 		end)
 		library:Notify("Money source hooked", "ok")
 	else
-		warn("[MONEY] no '" .. MONEY_LABEL .. "' found")
+		warn("[MONEY] no '" .. GAME.MONEY_LABEL .. "' found")
 	end
 
 	if lvlLbl then
@@ -1532,7 +1680,7 @@ local function watch_money()
 			if stats.lastGold then
 				push_history(stats.lastGold, true)
 			end
-			task.wait(HEARTBEAT)
+			task.wait(GAME.HEARTBEAT)
 		end
 	end)
 end
@@ -1767,9 +1915,9 @@ local function restore_cache()
 	local t = now_secs()
 	local restoredTimers = 0
 	for _, e in ipairs(saved.timers or {}) do
-		if e.id and type(e.phase) == "number" and (t - (tonumber(e.seenAt) or 0)) < TIMER_TTL then
+		if e.id and type(e.phase) == "number" and (t - (tonumber(e.seenAt) or 0)) < GAME.TIMER_TTL then
 			timers[e.id] = {
-				phase = e.phase % CYCLE,
+				phase = e.phase % GAME.CYCLE,
 				samples = tonumber(e.samples) or 1,
 				seenAt = tonumber(e.seenAt) or t,
 				playing = tonumber(e.playing),
@@ -2188,7 +2336,11 @@ local function auto_loop()
 
 		-- optional runtime limit
 		if CFG.AUTO_MAX_HOURS > 0 and auto_runtime() >= CFG.AUTO_MAX_HOURS * 3600 then
-			library:Notify(string.format("Ran for %s — auto off (time limit)", dur(auto_runtime())), "warn", 10)
+			library:Notify(
+				string.format("Ran for %s — auto off (time limit)", dur(auto_runtime())),
+				"warn",
+				10
+			)
 			auto_enabled = false
 			persist_save(true)
 			break
@@ -2282,8 +2434,8 @@ local function auto_loop()
 		-- stay through the payout: wait for zero, then claim_offset more
 		local mine = my_remaining()
 		if mine then
-			if claim_offset > 0 and mine > CYCLE - claim_offset then
-				set_auto_status(string.format("payout %.1fs", claim_offset - (CYCLE - mine)))
+			if claim_offset > 0 and mine > GAME.CYCLE - claim_offset then
+				set_auto_status(string.format("payout %.1fs", claim_offset - (GAME.CYCLE - mine)))
 				task.wait(0.15)
 				continue
 			end
@@ -2370,7 +2522,13 @@ local function toggle_auto(force)
 	if auto_enabled then
 		local limit = (CFG.AUTO_MAX_HOURS > 0) and string.format(", limit %gh", CFG.AUTO_MAX_HOURS) or ""
 		library:Notify(
-			string.format("Auto ON — pool %d, lead %ds, window +%ds%s", explore_target, min_lead, hop_window, limit),
+			string.format(
+				"Auto ON — pool %d, lead %ds, window +%ds%s",
+				explore_target,
+				min_lead,
+				hop_window,
+				limit
+			),
 			"ok"
 		)
 		task.spawn(auto_loop)
@@ -2819,7 +2977,7 @@ do
 			write_next_target(true)
 			if auto_enabled then
 				logf(
-					"HEARTBEAT runtime %s | hops %d | pool %d | gold %s",
+					"GAME.HEARTBEAT runtime %s | hops %d | pool %d | gold %s",
 					dur(auto_runtime()),
 					stats.hops,
 					timer_count(),
@@ -2829,10 +2987,24 @@ do
 		end
 	end)
 
-	if auto_enabled and not should_stop() then
+	-- In the menu place there is nothing to farm and nothing to hop to: click
+	-- through to the AFK world and let the script re-inject on the other side.
+	if not in_afk_world() and in_entry_place() then
+		library:Notify("Menu detected — entering the AFK world...", "warn", 6)
+		task.spawn(function()
+			enter_afk_world()
+		end)
+	elseif auto_enabled and not should_stop() then
 		auto_started_at = auto_started_at or os.time()
-		library:Notify("Auto resumed after teleport", "ok")
-		task.spawn(auto_loop)
+		task.spawn(function()
+			if not in_afk_world() then
+				enter_afk_world()
+			end
+			if auto_enabled and not should_stop() then
+				library:Notify("Auto resumed", "ok")
+				auto_loop()
+			end
+		end)
 	end
 
 	-- a superseded copy tears itself down instead of lingering
