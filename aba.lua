@@ -124,7 +124,6 @@ local GAME = {
 	HEARTBEAT = 15, -- seconds between forced history samples
 }
 
-
 --// auto entry: the client lands in the menu after every launch, and the
 --// payout world has to be opened before any timer or gold exists
 local ENTRY = {
@@ -138,7 +137,6 @@ local ENTRY = {
 	timeout = 45, -- give up after this many seconds
 	retry = 2, -- seconds between attempts
 }
-
 
 --// sliders / inputs
 local MIN_LEAD_MIN, MIN_LEAD_MAX = 1, 20
@@ -1110,11 +1108,7 @@ local function write_next_target(force)
 		return
 	end
 	-- line 1: JobId | line 2: rebuilds this client | line 3: placeId
-	pcall(
-		writefile,
-		CFG.TARGET_FILE,
-		id .. "\n" .. tostring(client_hops) .. "\n" .. tostring(game.PlaceId)
-	)
+	pcall(writefile, CFG.TARGET_FILE, id .. "\n" .. tostring(client_hops) .. "\n" .. tostring(game.PlaceId))
 end
 
 --// breadcrumb log: survives the crash, unlike anything held in memory
@@ -1461,18 +1455,19 @@ local function parse_seconds(txt)
 	return n and tonumber(n) or nil
 end
 
+local TP = { inFlightAt = 0, LOCK_TTL = 25, failed = false, reason = "" }
+
 --==============================================================
 --  TELEPORT STATE
 --  Declared before AUTO ENTRY because the entry teleport needs to observe
 --  TeleportInitFailed too.
 --==============================================================
-local teleport_failed = false
-local teleport_fail_reason = ""
+-- failure state is shared with the entry teleport, hence the table
 
 TeleportService.TeleportInitFailed:Connect(function(player, result, errorMessage)
 	if player == LocalPlayer then
-		teleport_failed = true
-		teleport_fail_reason = (errorMessage ~= "" and errorMessage) or tostring(result)
+		TP.failed = true
+		TP.reason = (errorMessage ~= "" and errorMessage) or tostring(result)
 	end
 end)
 
@@ -1667,7 +1662,7 @@ local function enter_afk_world()
 			end
 
 			tries += 1
-			teleport_failed, teleport_fail_reason = false, ""
+			TP.failed, TP.reason = false, ""
 
 			local ok, err = pcall(function()
 				TeleportService:Teleport(ENTRY.teleportTo, LocalPlayer)
@@ -1680,7 +1675,7 @@ local function enter_afk_world()
 
 			-- give the teleport room to either take or report a failure
 			local wait_until = tick() + 8
-			while tick() < wait_until and not teleport_failed do
+			while tick() < wait_until and not TP.failed do
 				if in_afk_world() then
 					logf("ENTRY ok via teleport after %d try(s)", tries)
 					return true
@@ -1688,9 +1683,9 @@ local function enter_afk_world()
 				task.wait(0.2)
 			end
 
-			if teleport_failed then
-				logf("ENTRY teleport rejected: %s", teleport_fail_reason)
-				if teleport_fail_reason:lower():find("flood") then
+			if TP.failed then
+				logf("ENTRY teleport rejected: %s", TP.reason)
+				if TP.reason:lower():find("flood") then
 					task.wait(10)
 				end
 			end
@@ -1723,8 +1718,13 @@ local function enter_afk_world()
 		if btn then
 			attempts += 1
 			if attempts == 1 then
-				logf("ENTRY found %s | visible=%s | size=%dx%d", why,
-					tostring(btn.Visible), btn.AbsoluteSize.X, btn.AbsoluteSize.Y)
+				logf(
+					"ENTRY found %s | visible=%s | size=%dx%d",
+					why,
+					tostring(btn.Visible),
+					btn.AbsoluteSize.X,
+					btn.AbsoluteSize.Y
+				)
 			end
 			local how = click_button(btn, attempts)
 			logf("ENTRY click #%d via %s", attempts, how or "FAILED")
@@ -1743,8 +1743,7 @@ local function enter_afk_world()
 		task.wait(ENTRY.retry)
 	end
 
-	logf("ENTRY TIMEOUT after %ds (%d clicks) — still not in the AFK world",
-		ENTRY.timeout, attempts)
+	logf("ENTRY TIMEOUT after %ds (%d clicks) — still not in the AFK world", ENTRY.timeout, attempts)
 	library:Notify("Could not reach the AFK world automatically", "error", 8)
 	return false
 end
@@ -2206,7 +2205,14 @@ local function set_busy(state, joinText, smartText, smallestText, hopText)
 	btnHop.Text = hopText or "Random Hop"
 end
 
-local teleport_in_flight = false
+-- Guards against several coroutines calling TeleportService at once. This is a
+-- timestamp rather than a boolean on purpose: a teleport can be accepted and
+-- then silently never happen, and a boolean would latch true forever, refusing
+-- every later join (including manual ones) until the script is reinjected.
+
+local function teleport_locked()
+	return (tick() - TP.inFlightAt) < TP.LOCK_TTL
+end
 
 local function attempt_join(jobId, timeoutSecs, isExplore)
 	timeoutSecs = timeoutSecs or 20
@@ -2217,12 +2223,12 @@ local function attempt_join(jobId, timeoutSecs, isExplore)
 	end
 
 	-- one teleport at a time, no matter how many coroutines ask
-	if teleport_in_flight then
-		return false, "teleport already in flight"
+	if teleport_locked() then
+		return false, string.format("teleport in flight (%.0fs left)", TP.LOCK_TTL - (tick() - TP.inFlightAt))
 	end
-	teleport_in_flight = true
+	TP.inFlightAt = tick()
 
-	teleport_failed, teleport_fail_reason = false, ""
+	TP.failed, TP.reason = false, ""
 
 	local mineNow = my_remaining()
 	local targetE = timers[jobId]
@@ -2253,26 +2259,42 @@ local function attempt_join(jobId, timeoutSecs, isExplore)
 		TeleportService:TeleportToPlaceInstance(game.PlaceId, jobId, LocalPlayer, nil, tpData)
 	end)
 	if not ok then
-		teleport_failed = true
-		teleport_fail_reason = tostring(err)
+		TP.failed = true
+		TP.reason = tostring(err)
 	end
 
 	local timeout = tick() + timeoutSecs
-	while tick() < timeout and not teleport_failed do
+	while tick() < timeout and not TP.failed do
 		task.wait(0.1)
 	end
 
-	if teleport_failed then
-		teleport_in_flight = false
-		logf("HOP FAILED: %s", teleport_fail_reason)
+	if TP.failed then
+		TP.inFlightAt = 0
+		logf("HOP FAILED: %s", TP.reason)
 		stats.hops = math.max(0, stats.hops - 1)
 		if isExplore then
 			stats.explored = math.max(0, stats.explored - 1)
 		end
-		return false, teleport_fail_reason
+		return false, TP.reason
 	end
 
 	logf("HOP ACCEPTED, transferring")
+
+	-- Normally the DataModel is torn down here and nothing below ever runs.
+	-- If we are still alive well past that point the teleport was accepted and
+	-- then dropped, so undo the bookkeeping and let the caller try again.
+	task.delay(TP.LOCK_TTL, function()
+		if TP.inFlightAt > 0 and (tick() - TP.inFlightAt) >= TP.LOCK_TTL then
+			TP.inFlightAt = 0
+			logf("HOP STALLED: accepted but never transferred, releasing lock")
+			stats.hops = math.max(0, stats.hops - 1)
+			client_hops = math.max(0, client_hops - 1)
+			if isExplore then
+				stats.explored = math.max(0, stats.explored - 1)
+			end
+		end
+	end)
+
 	return true
 end
 
@@ -2536,11 +2558,7 @@ local function auto_loop()
 
 		-- optional runtime limit
 		if CFG.AUTO_MAX_HOURS > 0 and auto_runtime() >= CFG.AUTO_MAX_HOURS * 3600 then
-			library:Notify(
-				string.format("Ran for %s — auto off (time limit)", dur(auto_runtime())),
-				"warn",
-				10
-			)
+			library:Notify(string.format("Ran for %s — auto off (time limit)", dur(auto_runtime())), "warn", 10)
 			auto_enabled = false
 			persist_save(true)
 			break
@@ -2661,10 +2679,21 @@ local function auto_loop()
 			if ok then
 				task.wait(5)
 			else
-				timers[targetId] = nil
-				persist_save(true)
-				if reason:lower():find("flood") then
+				local why = reason:lower()
+
+				-- "in flight" and "superseded" say nothing about the target,
+				-- so keep its phase; only a real rejection means it is dead
+				local ourFault = why:find("in flight") or why:find("superseded")
+
+				if not ourFault then
+					timers[targetId] = nil
+					persist_save(true)
+				end
+
+				if why:find("flood") then
 					cooldown(15)
+				elseif ourFault then
+					task.wait(2)
 				end
 			end
 		else
@@ -2724,13 +2753,7 @@ local function toggle_auto(force)
 	if auto_enabled then
 		local limit = (CFG.AUTO_MAX_HOURS > 0) and string.format(", limit %gh", CFG.AUTO_MAX_HOURS) or ""
 		library:Notify(
-			string.format(
-				"Auto ON — pool %d, lead %ds, window +%ds%s",
-				explore_target,
-				min_lead,
-				hop_window,
-				limit
-			),
+			string.format("Auto ON — pool %d, lead %ds, window +%ds%s", explore_target, min_lead, hop_window, limit),
 			"ok"
 		)
 		task.spawn(auto_loop)
