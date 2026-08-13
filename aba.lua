@@ -3,6 +3,26 @@ if not game:IsLoaded() then
 end
 
 --==============================================================
+--  PLACE GUARD
+--  Runs before everything else, including the singleton slot, so an
+--  injection into an unrelated game leaves no trace at all: no UI, no
+--  signals, no files touched, no teleport attempted. Executors with
+--  auto-execute will fire this script in every game the user opens, and
+--  silently doing nothing is the only correct behaviour there.
+--==============================================================
+local FARM_PLACE = 5411459567 -- the AFK world where the farm actually runs
+local LOBBY_PLACE = 1458767429 -- the menu the client lands in on launch
+
+local ALLOWED_PLACES = {
+	[FARM_PLACE] = "afk world",
+	[LOBBY_PLACE] = "lobby",
+}
+
+if not ALLOWED_PLACES[game.PlaceId] then
+	return
+end
+
+--==============================================================
 --  SINGLETON GUARD (identity based)
 --  Executors re-inject on teleport, and every live instance queues the
 --  script again — so copies double on each hop. A shared boolean flag
@@ -127,19 +147,22 @@ local GAME = {
 	HEARTBEAT = 15, -- seconds between forced history samples
 }
 
+
 --// auto entry: the client lands in the menu after every launch, and the
 --// payout world has to be opened before any timer or gold exists
 local ENTRY = {
 	enabled = true,
-	placeId = 0, -- lobby/menu place. 0 = act in any place
+	-- both derived from ALLOWED_PLACES so there is one source of truth
+	placeId = LOBBY_PLACE, -- only click/teleport out of the lobby
 	-- The menu button just calls TeleportService:Teleport(<id>), so we can do
 	-- that ourselves and skip the UI entirely. Set to 0 to click instead.
-	teleportTo = 5411459567, -- AFK world placeId
+	teleportTo = FARM_PLACE, -- AFK world placeId
 	gui = "MainMenu", -- fallback: PlayerGui child holding the menu
 	button = "afkworld", -- fallback: descendant to click
 	timeout = 45, -- give up after this many seconds
 	retry = 2, -- seconds between attempts
 }
+
 
 --// sliders / inputs
 local MIN_LEAD_MIN, MIN_LEAD_MAX = 1, 20
@@ -1016,12 +1039,8 @@ UserInputService.InputChanged:Connect(function(input)
 		end
 		if DRAG.active then
 			local d = input.Position - DRAG.start
-			main.Position = UDim2.new(
-				DRAG.origin.X.Scale,
-				DRAG.origin.X.Offset + d.X,
-				DRAG.origin.Y.Scale,
-				DRAG.origin.Y.Offset + d.Y
-			)
+			main.Position =
+				UDim2.new(DRAG.origin.X.Scale, DRAG.origin.X.Offset + d.X, DRAG.origin.Y.Scale, DRAG.origin.Y.Offset + d.Y)
 		end
 	end
 end)
@@ -1047,9 +1066,11 @@ local function apply_minimized(state, animate)
 
 	local target = minimized and COLLAPSED or EXPANDED
 	if animate then
-		TweenService
-			:Create(main, TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Size = target })
-			:Play()
+		TweenService:Create(
+			main,
+			TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+			{ Size = target }
+		):Play()
 	else
 		main.Size = target
 	end
@@ -1284,7 +1305,11 @@ local function write_next_target(force)
 		return
 	end
 	-- line 1: JobId | line 2: rebuilds this client | line 3: placeId
-	pcall(writefile, CFG.TARGET_FILE, id .. "\n" .. tostring(client_hops) .. "\n" .. tostring(game.PlaceId))
+	pcall(
+		writefile,
+		CFG.TARGET_FILE,
+		id .. "\n" .. tostring(client_hops) .. "\n" .. tostring(game.PlaceId)
+	)
 end
 
 --// breadcrumb log: survives the crash, unlike anything held in memory
@@ -1980,13 +2005,8 @@ local function enter_afk_world()
 		if btn then
 			attempts += 1
 			if attempts == 1 then
-				logf(
-					"ENTRY found %s | visible=%s | size=%dx%d",
-					why,
-					tostring(btn.Visible),
-					btn.AbsoluteSize.X,
-					btn.AbsoluteSize.Y
-				)
+				logf("ENTRY found %s | visible=%s | size=%dx%d", why,
+					tostring(btn.Visible), btn.AbsoluteSize.X, btn.AbsoluteSize.Y)
 			end
 			local how = click_button(btn, attempts)
 			logf("ENTRY click #%d via %s", attempts, how or "FAILED")
@@ -2005,7 +2025,8 @@ local function enter_afk_world()
 		task.wait(ENTRY.retry)
 	end
 
-	logf("ENTRY TIMEOUT after %ds (%d clicks) — still not in the AFK world", ENTRY.timeout, attempts)
+	logf("ENTRY TIMEOUT after %ds (%d clicks) — still not in the AFK world",
+		ENTRY.timeout, attempts)
 	library:Notify("Could not reach the AFK world automatically", "error", 8)
 	return false
 end
@@ -2500,7 +2521,8 @@ local function attempt_join(jobId, timeoutSecs, isExplore)
 
 	-- one teleport at a time, no matter how many coroutines ask
 	if teleport_locked() then
-		return false, string.format("teleport in flight (%.0fs left)", TP.LOCK_TTL - (tick() - TP.inFlightAt))
+		return false,
+			string.format("teleport in flight (%.0fs left)", TP.LOCK_TTL - (tick() - TP.inFlightAt))
 	end
 	TP.inFlightAt = tick()
 
@@ -2834,7 +2856,11 @@ local function auto_loop()
 
 		-- optional runtime limit
 		if CFG.AUTO_MAX_HOURS > 0 and auto_runtime() >= CFG.AUTO_MAX_HOURS * 3600 then
-			library:Notify(string.format("Ran for %s — auto off (time limit)", dur(auto_runtime())), "warn", 10)
+			library:Notify(
+				string.format("Ran for %s — auto off (time limit)", dur(auto_runtime())),
+				"warn",
+				10
+			)
 			auto_enabled = false
 			persist_save(true)
 			break
@@ -3029,7 +3055,13 @@ local function toggle_auto(force)
 	if auto_enabled then
 		local limit = (CFG.AUTO_MAX_HOURS > 0) and string.format(", limit %gh", CFG.AUTO_MAX_HOURS) or ""
 		library:Notify(
-			string.format("Auto ON — pool %d, lead %ds, window +%ds%s", explore_target, min_lead, hop_window, limit),
+			string.format(
+				"Auto ON — pool %d, lead %ds, window +%ds%s",
+				explore_target,
+				min_lead,
+				hop_window,
+				limit
+			),
 			"ok"
 		)
 		task.spawn(auto_loop)
